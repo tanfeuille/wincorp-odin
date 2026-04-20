@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wincorp-odin"
+version = "0.1.0"
+description = "Yggdrasil — Orchestrateur LLM generique WinCorp. Factory providers, circuit breaker, retry, sub-agents."
+requires-python = ">=3.12"
+authors = [
+    {name = "SPINEX Conseil & Gestion", email = "tp.huynh@spinex.fr"}
+]
+dependencies = [
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0.1",
+    "langchain-core>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "anthropic>=0.40.0",
+]
+
+[tool.setuptools]
+packages = ["wincorp_odin"]
+package-dir = {"" = "src"}
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+]
+providers-deepseek = ["langchain-deepseek>=0.1.0"]
+providers-openai = ["langchain-openai>=0.3.0"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["integration: tests lisant le vrai wincorp-urd (slow)"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+disallow_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.coverage.run]
+source = ["wincorp_odin"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+fail_under = 100
