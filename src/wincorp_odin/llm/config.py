@@ -1,6 +1,6 @@
 """Chargement + validation + interpolation YAML models.yaml.
 
-@spec specs/llm-factory.spec.md v1.2
+@spec specs/llm-factory.spec.md v1.3
 
 Responsabilites :
 - `_resolve_urd_path` : bifurcation dev (auto-detect .git) vs installed (env var) (R17).
@@ -8,6 +8,9 @@ Responsabilites :
 - `load_models_config` : parse safe_load (R14), taille max (R15), conflits OneDrive
   (§9.2), schema Pydantic (EC4/EC5/EC6), interpolation ${VAR} (R4, EC7-9),
   whitelist extra_kwargs (R13).
+
+v1.3 : ajout champs optionnels par modele circuit_breaker / retry / pricing
+(§22-24). Rétrocompat : fixtures v1.2 sans ces champs restent valides.
 """
 from __future__ import annotations
 
@@ -59,6 +62,11 @@ class ModelConfig:
     """Configuration resolue d'un modele (post-interpolation ${VAR}).
 
     SECURITE R10 : api_key_resolved n'apparait jamais dans repr/logs/exceptions.
+
+    v1.3 : champs optionnels middlewares (§22-24) :
+      - circuit_breaker_config : dict | None — passe tel quel a CircuitBreakerConfig
+      - retry_config : dict | None — passe tel quel a RetryConfig
+      - pricing_config : dict | None — {input_per_million_eur, output_per_million_eur}
     """
 
     name: str
@@ -77,6 +85,10 @@ class ModelConfig:
     when_thinking_disabled: dict[str, Any] | None
     extra_kwargs: dict[str, Any] = field(default_factory=dict)
     disabled: bool = False
+    # v1.3 — champs optionnels middlewares
+    circuit_breaker_config: dict[str, Any] | None = None
+    retry_config: dict[str, Any] | None = None
+    pricing_config: dict[str, Any] | None = None
 
     def __repr__(self) -> str:
         """Repr safe — redacte la cle API (R10)."""
@@ -103,6 +115,34 @@ class _DefaultsModel(BaseModel):
     supports_reasoning_effort: bool = False
 
 
+class _CircuitBreakerRawModel(BaseModel):
+    """Sous-schema circuit_breaker (v1.3 §22)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    failure_threshold: int = Field(gt=0)
+    recovery_timeout_sec: float = Field(gt=0)
+
+
+class _RetryRawModel(BaseModel):
+    """Sous-schema retry (v1.3 §23)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    base_delay_sec: float = Field(gt=0)
+    cap_delay_sec: float = Field(gt=0)
+    max_attempts: int = Field(gt=0)
+
+
+class _PricingRawModel(BaseModel):
+    """Sous-schema pricing (v1.3 §24)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    input_per_million_eur: float = Field(ge=0)
+    output_per_million_eur: float = Field(ge=0)
+
+
 class _RawModelEntry(BaseModel):
     """Un bloc modele tel que parse depuis YAML (avant interpolation).
 
@@ -127,6 +167,10 @@ class _RawModelEntry(BaseModel):
     when_thinking_disabled: dict[str, Any] | None = None
     extra_kwargs: dict[str, Any] = Field(default_factory=dict)
     disabled: bool = False
+    # v1.3 — middlewares optionnels
+    circuit_breaker: _CircuitBreakerRawModel | None = None
+    retry: _RetryRawModel | None = None
+    pricing: _PricingRawModel | None = None
 
 
 class _ModelsFile(BaseModel):
@@ -455,6 +499,12 @@ def load_models_config() -> dict[str, ModelConfig]:
             when_thinking_disabled=raw.when_thinking_disabled,
             extra_kwargs=dict(raw.extra_kwargs),
             disabled=raw.disabled,
+            # v1.3 — middlewares optionnels (dict ou None, passes aux wrappers)
+            circuit_breaker_config=(
+                raw.circuit_breaker.model_dump() if raw.circuit_breaker else None
+            ),
+            retry_config=raw.retry.model_dump() if raw.retry else None,
+            pricing_config=raw.pricing.model_dump() if raw.pricing else None,
         )
         result[raw.name] = cfg
 

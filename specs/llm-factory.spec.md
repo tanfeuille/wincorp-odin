@@ -1,11 +1,11 @@
-# wincorp_odin.llm — Specification (Phase 1.1 DeerFlow)
+# wincorp_odin.llm — Specification (Phase 1.1 + 1.4 + 1.5 + 1.6 DeerFlow)
 
-> **Statut :** DRAFT (post re-review adversarial — prêt build)
-> **Version :** 1.2.0
+> **Statut :** IMPLEMENTED (Phase 1.1 + 1.4-1.6 livrées + challenger adversarial v1.3.1 corrigé)
+> **Version :** 1.3.1
 > **Niveau :** 3 (exhaustif)
-> **Auteur :** Tan Phi HUYNH (consolidation 3 specs SDD Opus + 8 arbitrages review adversarial + 15 correctifs PB-001→PB-015 + 3 correctifs structurels PB-019 / points ouverts 1 et 2)
+> **Auteur :** Tan Phi HUYNH (consolidation v1.2 + extensions §22-26 Phase 1.4-1.6)
 > **Date de création :** 2026-04-20
-> **@plan** `memory/project_deerflow_inspiration_plan.md` Phase 1.1
+> **@plan** `memory/project_deerflow_inspiration_plan.md` Phases 1.1 + 1.4 + 1.5 + 1.6
 > **Nom logique** : `wincorp_odin.llm` (pas d'alias `mimir.llm` — isolation dure Odin↔Mimir)
 > **Package Python réel** : `wincorp_odin.llm` (repo `wincorp-odin`, Yggdrasil Tronc)
 
@@ -1053,6 +1053,270 @@ Aucun — l'architecture copy-on-write (PB-019) a été appliquée, les 2 points
 
 ---
 
+## 22. Circuit breaker (Phase 1.4)
+
+### 22.1 Objectif
+
+Protéger les appels LLM contre les pannes fournisseur (rate-limit sustained, API down) en coupant automatiquement les requêtes pendant la durée de récupération déclarée. Pattern closed/half-open/open thread-safe, inspiré DeerFlow `llm_error_handling_middleware`.
+
+### 22.2 États
+
+- **CLOSED** — état nominal : toutes les requêtes passent. Les échecs transient sont comptés.
+- **OPEN** — breaker déclenché : toutes les requêtes lèvent `CircuitOpenError` immédiatement, aucun appel provider. Dure `recovery_timeout_sec`.
+- **HALF_OPEN** — après `recovery_timeout_sec` écoulé depuis l'ouverture : une seule requête probe est autorisée. Si elle réussit → retour CLOSED + reset failure_count. Si elle échoue → retour OPEN avec nouveau timestamp.
+
+### 22.3 Classification des erreurs
+
+- **transient** (compte comme failure) : rate-limit (HTTP 429), timeout (`TimeoutError`, `asyncio.TimeoutError`), 5xx serveur (500, 502, 503, 504), `ConnectionError` réseau. `RetryExhaustedError` (§23) compte aussi.
+- **terminal** (NE compte PAS comme failure, juste re-raise) : 400 bad request, 401 auth, 403 forbidden, 404 not found, toute exception métier non-réseau (`ValueError` consommateur, etc.).
+- Classification via helper `_classify_http_error(exc) -> Literal["transient", "terminal", "unknown"]`. Détection par nom de classe (`*.RateLimitError`, `*.APITimeoutError`) + attribut `status_code` si présent. Pas d'import dur du SDK `anthropic` (isolation).
+
+### 22.4 Config
+
+Optionnel par modèle via YAML `circuit_breaker: {failure_threshold: int, recovery_timeout_sec: float}`. Défauts :
+- `failure_threshold = 5`
+- `recovery_timeout_sec = 60.0`
+
+Surcharges globales via env vars `WINCORP_LLM_CB_FAILURE_THRESHOLD`, `WINCORP_LLM_CB_RECOVERY_SEC` (appliqués si le YAML ne fixe pas).
+
+### 22.5 API
+
+```python
+from wincorp_odin.llm.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitOpenError
+
+cfg = CircuitBreakerConfig(failure_threshold=5, recovery_timeout_sec=60.0)
+cb = CircuitBreaker(name="sonnet", config=cfg)
+
+# Wrapper autour d'un callable (utilisé par factory)
+wrapped = cb.wrap(model_instance)  # retourne un proxy avec .invoke/.ainvoke protégés
+```
+
+### 22.6 Règles (Rx)
+
+- **R20 — Transitions CLOSED → OPEN** — après `failure_threshold` erreurs transient successives, transition OPEN. Le compteur ne se réinitialise pas sur succès en CLOSED (design volontaire : 5 échecs/10 min = signal, pas de reset lâche) — il se réinitialise UNIQUEMENT sur succès en HALF_OPEN. Modification possible future (sliding window) non retenue Phase 1.4 (KISS).
+- **R21 — Transition OPEN → HALF_OPEN → CLOSED/OPEN** — après `recovery_timeout_sec` écoulé depuis le passage OPEN, la prochaine requête déclenche HALF_OPEN (1 seule probe autorisée, les requêtes concurrentes sont refusées `CircuitOpenError`). Succès → CLOSED + reset. Échec → retour OPEN.
+- **R22 — Classification erreurs** — seules les erreurs `transient` (§22.3) comptent comme failure. Les erreurs terminal sont re-levées telles quelles sans incrémenter le compteur.
+- **R22b — Thread safety** — `threading.Lock` par instance `CircuitBreaker` protège toutes les transitions d'état ET l'autorisation de la probe HALF_OPEN. Un seul thread peut tester le probe ; les autres stallent un court instant derrière le lock puis voient l'état résultant.
+
+### 22.7 Exception
+
+```python
+class CircuitOpenError(OdinLlmError):
+    """Breaker ouvert — requête refusée (§22).
+    
+    Attributs :
+        model_name: nom logique du modèle
+        retry_after_sec: float — secondes avant réouverture possible
+    """
+```
+
+---
+
+## 23. Retry exponentiel + Retry-After (Phase 1.5)
+
+### 23.1 Objectif
+
+Absorber les erreurs transitoires via un retry intelligent : exponentiel capé avec jitter, parsing `Retry-After` pour respecter les instructions serveur, combiné avec circuit breaker (§22).
+
+### 23.2 Stratégie
+
+- Exponentiel capé : délai = `min(base_delay_sec * 2 ** (attempt - 1), cap_delay_sec)`.
+- Si l'erreur expose un header `Retry-After` (secondes) ou `Retry-After-Ms` (millisecondes) → prend **priorité** sur l'exponentiel pour cet essai (capé à `cap_delay_sec`).
+- Jitter optionnel `±20%` (défaut OFF Phase 1.5 — activable via env var `WINCORP_LLM_RETRY_JITTER=1`).
+- `max_attempts` tentatives max (défaut 3 — signifie 1 appel initial + 2 retries).
+
+### 23.3 Classification
+
+- **retryable** : 429, 502, 503, 504, `TimeoutError`, `ConnectionError`. Réutilise `_classify_http_error` de §22 (transient).
+- **non-retryable** : 400, 401, 403, 404, toute exception autre. Re-raise immédiat.
+
+### 23.4 Parsing headers
+
+Helper `_parse_retry_after(exc) -> float | None` :
+- Cherche attribut `response.headers`, `headers`, `response_headers`, `_response`.
+- Teste `Retry-After` (secondes, entier ou date RFC 7231), `Retry-After-Ms` (millisecondes, entier).
+- Retourne float secondes ou None.
+
+### 23.5 Config
+
+Optionnel par modèle via YAML `retry: {base_delay_sec: float, cap_delay_sec: float, max_attempts: int}`. Défauts :
+- `base_delay_sec = 1.0`
+- `cap_delay_sec = 30.0`
+- `max_attempts = 3`
+
+### 23.6 API
+
+```python
+from wincorp_odin.llm.retry import RetryConfig, RetryWrapper, RetryExhaustedError
+
+cfg = RetryConfig(base_delay_sec=1.0, cap_delay_sec=30.0, max_attempts=3)
+wrapped = RetryWrapper(model_instance, cfg).wrap()
+```
+
+### 23.7 Règles
+
+- **R23 — Retry retryable only** — seules les erreurs classifiées retryable déclenchent un retry. Les autres se propagent immédiatement.
+- **R24 — Parse Retry-After** — si header détecté, l'exponentiel est écrasé par la valeur du header (capée à `cap_delay_sec`). Si le header est invalide / absent, retour à l'exponentiel.
+- **R25 — Max attempts** — après `max_attempts` échecs consécutifs, lève `RetryExhaustedError` en chaîne `from last_exc`. Le circuit breaker externe (§22) voit ça comme 1 failure transient unique (pas N — KISS, le burst est déjà absorbé).
+
+### 23.8 Exception
+
+```python
+class RetryExhaustedError(OdinLlmError):
+    """Retries exhauses — dernière erreur chaînée via __cause__ (§23).
+    
+    Attributs :
+        attempts: int
+        last_error_class: str (nom de la dernière erreur)
+    """
+```
+
+---
+
+## 24. Token usage tracking (Phase 1.6)
+
+### 24.1 Objectif
+
+Instrumenter les appels LLM pour tracker la consommation input/output tokens et le coût EUR estimé. Inspiré DeerFlow `token_usage_middleware` mais avec **sink pluggable** (log, file, supabase).
+
+### 24.2 Schéma événement
+
+```python
+@dataclass(frozen=True)
+class TokenUsageEvent:
+    timestamp: float         # time.time() unix epoch
+    model_name: str          # nom logique (sonnet, opus, haiku)
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_eur: float          # calculé depuis models.yaml pricing
+    session_id: str | None = None
+    agent_name: str | None = None
+    client_id: str | None = None
+    
+    def to_json_dict(self) -> dict[str, Any]:
+        """Serialise en dict JSON-compatible (pour sinks)."""
+```
+
+### 24.3 Calcul coût
+
+```
+cost_eur = (input_tokens / 1_000_000) * pricing.input_per_million_eur
+         + (output_tokens / 1_000_000) * pricing.output_per_million_eur
+```
+
+Pricing lu depuis `models.yaml` champ `pricing: {input_per_million_eur, output_per_million_eur}`. Obligatoire **si token tracking actif** pour ce modèle. Sinon coût = 0.0 + WARNING FR log « pricing manquant pour modèle 'X' ».
+
+### 24.4 Sinks
+
+3 options configurables via env var `WINCORP_LLM_TOKEN_SINK=log|file|supabase` (défaut `log`) :
+
+- **log** (défaut) — `logger.info("llm_usage_event", extra=event.to_json_dict())`. JSON sérialisé via formatter standard.
+- **file** — append JSONL dans `wincorp-odin/.token_usage/events.jsonl`. `threading.Lock` protège l'append. Dossier créé si absent. Override path via env var `WINCORP_LLM_TOKEN_SINK_FILE`.
+- **supabase** — stub Phase 1.6a : `NotImplementedError` FR claire. Implémentation Phase 1.6b (insert table `llm_usage` via heimdall API).
+
+Sink factory : `get_sink(name: str) -> TokenSink`. Chaque sink implémente protocole `TokenSink.emit(event: TokenUsageEvent) -> None`.
+
+### 24.5 Interception
+
+`TokenTrackingWrapper` enveloppe l'instance ChatAnthropic :
+- `.invoke(*args, **kwargs)` → appelle provider → lit `result.usage_metadata` (dict standard LangChain `{input_tokens, output_tokens, total_tokens}`) → construit `TokenUsageEvent` → emit.
+- `.ainvoke(*args, **kwargs)` → idem mais async.
+- Si `usage_metadata` absent (modèle non conforme) : WARNING FR log, event émis avec tokens=0, pas d'exception.
+- Si le call lève : pas d'event émis (l'appel a échoué, rien à compter).
+
+### 24.6 Règles
+
+- **R26 — Intercept usage_metadata** — après chaque appel réussi à `invoke`/`ainvoke`, lire `result.usage_metadata` selon contrat LangChain. Manquant → WARNING FR + event à zéro.
+- **R27 — Cost calculation** — via pricing YAML. Si absent → cost_eur=0.0 + WARNING FR. Jamais de hardcode prix dans le code.
+- **R28 — Sink pluggable** — la sélection se fait au boot via env var. `get_sink` crashe FR si valeur invalide. Un échec de sink (ex disque plein pour file) → WARNING FR, pas d'exception propagée au caller (la requête LLM a déjà réussi, on ne casse pas sur l'observabilité).
+
+### 24.7 Exception
+
+```python
+class TokenTrackingError(OdinLlmError):
+    """Erreur d'instrumentation tokens (§24).
+    
+    Levée seulement en configuration invalide (sink inconnu, etc.).
+    Jamais levée depuis un call LLM réussi (R28).
+    """
+```
+
+---
+
+## 25. Intégration factory (Phase 1.4-1.6 dans create_model)
+
+### 25.1 Ordre des wrappers
+
+De l'intérieur (raw) vers l'extérieur (user-facing) :
+
+```
+ChatAnthropic (raw)
+  → TokenTrackingWrapper  (interne — compte tout, même échoués au niveau call LLM)
+  → RetryWrapper          (retry avant breaker)
+  → CircuitBreaker        (le plus externe — bloque avant tout si OPEN)
+```
+
+Rationale :
+- Tracking au plus près du call réel (compte les tokens de chaque attempt réussi).
+- Retry avant breaker pour qu'un burst 429 absorbable par 2 retries ne compte pas comme failure breaker.
+- Breaker en extérieur : si OPEN, on court-circuite tout (zéro coût token, zéro retry).
+
+### 25.2 Signature `create_model`
+
+```python
+def create_model(
+    name: str,
+    thinking_enabled: bool = False,
+    with_circuit_breaker: bool = True,
+    with_retry: bool = True,
+    with_token_tracking: bool = True,
+) -> Any:
+    """Instancie modèle + wrappers middlewares optionnels.
+    
+    Les params with_* par défaut True garantissent la robustesse prod. 
+    Les tests Phase 1.1 passent False pour valider le contrat raw.
+    Rétrocompat : signatures positionnelles inchangées (name, thinking_enabled).
+    """
+```
+
+### 25.3 Cache
+
+Le cache keye désormais par `(name, thinking_enabled, with_circuit_breaker, with_retry, with_token_tracking)` — 5-tuple. Même nom logique avec middlewares différents = instances distinctes.
+
+### 25.4 Rétrocompatibilité
+
+- Les 87 tests Phase 1.1 passent `with_circuit_breaker=False, with_retry=False, with_token_tracking=False` pour conserver l'assertion brute sur le mock ChatAnthropic.
+- Les consommateurs actuels (aucun en Phase 1.1) appellent `create_model(name)` → reçoivent instance wrappée par défaut (3 middlewares actifs). Documentation consommateur Phase 1.9.
+- La conftest autouse met à jour `_reset_factory_state` pour vider aussi `_breaker_instances` (registre global des breakers par modèle pour persistance cross-calls dans la même session).
+
+### 25.5 Registre breakers
+
+Le circuit breaker doit persister entre appels `create_model(name)` consécutifs (sinon le compteur se reset à chaque create). Stocké dans `_breaker_instances: dict[str, CircuitBreaker]` keyé par nom logique. Créé lazy, vidé par `_reload_for_tests`.
+
+---
+
+## 26. Nouveaux edge cases (Phase 1.4-1.6)
+
+| # | Scénario | Comportement | Sévérité |
+|---|----------|--------------|----------|
+| EC28 | `CircuitBreaker` OPEN + requête | `CircuitOpenError` immédiat, attr `retry_after_sec` renseigné | RUNTIME |
+| EC29 | `CircuitBreaker` HALF_OPEN + probe succès | Retour CLOSED, failure_count=0 | OK |
+| EC30 | `CircuitBreaker` HALF_OPEN + probe échec | Retour OPEN, nouveau timestamp, `CircuitOpenError` aux suivants | RUNTIME |
+| EC31 | `CircuitBreaker` HALF_OPEN + 2 requêtes concurrentes | 1 seul probe autorisé, l'autre reçoit `CircuitOpenError` | RUNTIME |
+| EC32 | Erreur terminal (401) pendant CLOSED | Re-raise, failure_count inchangé | RUNTIME |
+| EC33 | Retry exhausted (3 échecs 429) | `RetryExhaustedError` chaîné `from last_exc`, breaker compte 1 failure | RUNTIME |
+| EC34 | `Retry-After: 5` sur première erreur | Délai 5s au lieu de `base_delay_sec * 2^0 = 1s` | — |
+| EC35 | `Retry-After` > `cap_delay_sec` | Délai écrasé à `cap_delay_sec` (jamais > cap) | — |
+| EC36 | `Retry-After-Ms: 2500` | Délai 2.5s | — |
+| EC37 | `result.usage_metadata` absent | WARNING FR + event zéro tokens, pas d'exception | WARNING |
+| EC38 | Pricing manquant dans YAML | WARNING FR + cost_eur=0.0 + event émis | WARNING |
+| EC39 | `WINCORP_LLM_TOKEN_SINK=inconnu` | `TokenTrackingError` au boot sink | FATAL |
+| EC40 | Sink file : écriture disque échoue | WARNING FR, pas d'exception au caller (observabilité n'interrompt pas la prod) | WARNING |
+| EC41 | Sink supabase utilisé Phase 1.6a | `NotImplementedError` FR claire « Phase 1.6b à venir, fallback sur sink=log » | FATAL au sink |
+
+---
+
 ## Changelog
 
 | Version | Date | Modification |
@@ -1060,9 +1324,11 @@ Aucun — l'architecture copy-on-write (PB-019) a été appliquée, les 2 points
 | 1.0.0 | 2026-04-20 | Création initiale. Consolidation de 3 specs SDD Opus parallèles (archi / edge cases / testability). Review adversarial lancée. |
 | 1.1.0 | 2026-04-20 | 15 corrections PB-001→PB-015 appliquées post review adversarial. Déplacement `wincorp-mimir` → `wincorp-odin` (option B). `MimirLlmError` → `OdinLlmError`. Package `wincorp_odin.llm`. Sections nouvelles §13.0, §16 étendu, §18, §19, §20. 17 tests figés (15 + 2 nouveaux PB-003/PB-010). Spec prête build Phase 1.1. |
 | 1.2.0 | 2026-04-20 | 3 corrections structurelles post re-review adversarial (cf. §21) : (1) PB-019 budget runtime sous lock → copy-on-write avec R19b (§10.3 réécrit, nouveau budget runtime 500 ms, EC26, 2 nouveaux tests R19b) ; (2) retrait R16 timeout parsing YAML non-interrompable portable (§19.4 justification, EC24 reformulé) ; (3) R17 bifurqué dev vs installed avec env var obligatoire en installed (EC27, helper `_assert_under_allowed_root`, 3 nouveaux tests R17). Interface publique inchangée. |
+| 1.3.0 | 2026-04-20 | **Extensions Phase 1.4-1.6 DeerFlow middlewares** : §22 Circuit breaker (états CLOSED/HALF_OPEN/OPEN, thread-safe, `CircuitOpenError`, R20-R22b, EC28-32) · §23 Retry exponentiel + Retry-After parsing (R23-R25, `RetryExhaustedError`, EC33-36) · §24 Token tracking (dataclass `TokenUsageEvent`, sinks log/file/supabase-stub, `TokenTrackingError`, R26-R28, EC37-41) · §25 Intégration factory (ordre wrappers raw→tokens→retry→breaker, params `with_*`, cache 5-tuple, registre breakers) · §26 14 nouveaux edge cases · models.yaml : ajout champs optionnels `circuit_breaker`, `retry`, `pricing` par modèle (tarifs Anthropic avril 2026). Interface Phase 1.1 rétrocompatible via params défaut. |
+| 1.3.1 | 2026-04-20 | **6 corrections post challenger adversarial v1.3** : (PR-013) `__setattr__` délégation sur 3 wrappers (fix AttributeError slots avec assignations LangChain type `model.callbacks = [...]`) · (PR-014) docstrings FR explicitant lecture hors-lock best-effort sur `_breaker_instances` + `CircuitBreaker.state/failure_count` · (PR-015) `FileSink.__init__` mkdir try/except fallback warning (respect R28 swallow sink errors) · (PR-016) probe HALF_OPEN ne consomme pas max_attempts retry — `RetryWrapper` accepte `breaker_ref` optionnel et check `state == HALF_OPEN` avant chaque attempt (factory réorganise ordre création) · (PR-018) `RetryConfig.__post_init__` validation `max_attempts >= 1`, `base_delay_sec > 0`, `cap_delay_sec >= base_delay_sec` (fix bug latent `max_attempts=0`) · (PR-019) migration `threading.local()` → `contextvars.ContextVar` pour compatibilité asyncio Phase 2 (fallback thread-local conservé pour compat test). Tests : 179 → 196 (+17). 100% branch coverage maintenu. |
 
 ---
 
 ## @spec
 
-`@spec specs/llm-factory.spec.md v1.2` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.
+`@spec specs/llm-factory.spec.md v1.3` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.

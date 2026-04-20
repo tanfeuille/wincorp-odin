@@ -40,6 +40,11 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# Tests : autorise des noms d'exceptions de test sans suffixe Error (N818)
+# et noms de classes utilitaires (FakeResp, etc.)
+"tests/**/*.py" = ["N818"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

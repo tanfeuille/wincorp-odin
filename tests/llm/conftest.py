@@ -26,6 +26,7 @@ def _reset_factory_state(monkeypatch: pytest.MonkeyPatch) -> None:
     factory._cache.clear()
     factory._resolved_configs.clear()
     factory._deferred_resolutions.clear()
+    factory._breaker_instances.clear()  # v1.3 — reset breakers persistants
     factory._yaml_mtime = None
     factory._last_mtime_check = 0.0
     _registry._class_cache.clear()

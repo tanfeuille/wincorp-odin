@@ -1,9 +1,12 @@
 """Hierarchie des exceptions Odin LLM — messages FR actionnables.
 
-@spec specs/llm-factory.spec.md v1.2
+@spec specs/llm-factory.spec.md v1.3
 
 Regles de redaction R10/R10b/R10c : toute exception qui peut wrapper un appel
 reseau/instanciation strip la cle API des `args` et de la chaine `__cause__`.
+
+v1.3 : ajout CircuitOpenError, RetryExhaustedError, TokenTrackingError
+pour les middlewares Phase 1.4/1.5/1.6.
 """
 from __future__ import annotations
 
@@ -102,3 +105,66 @@ class ModelAuthenticationError(OdinLlmError):
                 cursor.args = tuple(_redact(a) for a in cursor.args)
             cursor = cursor.__cause__
             depth += 1
+
+
+# ---------------------------------------------------------------------------
+# v1.3 — middlewares Phase 1.4/1.5/1.6
+# ---------------------------------------------------------------------------
+
+
+class CircuitOpenError(OdinLlmError):
+    """Breaker ouvert — requete refusee (EC28, §22).
+
+    Attributs :
+        model_name: nom logique du modele.
+        retry_after_sec: float — secondes estimees avant reouverture (probe half-open).
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        retry_after_sec: float,
+        message: str | None = None,
+    ) -> None:
+        self.model_name = model_name
+        self.retry_after_sec = retry_after_sec
+        msg = message or (
+            f"[ERREUR] Circuit breaker ouvert pour modele '{model_name}' — "
+            f"nouvelle tentative autorisee dans {retry_after_sec:.1f}s. "
+            f"Verifier la sante du provider (rate-limit, panne, auth)."
+        )
+        super().__init__(msg)
+
+
+class RetryExhaustedError(OdinLlmError):
+    """Retries exhauses apres `attempts` tentatives (EC33, §23).
+
+    La derniere erreur est chainee via `raise ... from last_exc`.
+
+    Attributs :
+        attempts: int — nombre total de tentatives effectuees.
+        last_error_class: str — nom qualifie de la derniere exception.
+    """
+
+    def __init__(
+        self,
+        attempts: int,
+        last_error_class: str,
+        message: str | None = None,
+    ) -> None:
+        self.attempts = attempts
+        self.last_error_class = last_error_class
+        msg = message or (
+            f"[ERREUR] Retry epuise apres {attempts} tentatives. "
+            f"Derniere erreur : {last_error_class}. "
+            f"Verifier la sante du provider ou ajuster retry.max_attempts dans models.yaml."
+        )
+        super().__init__(msg)
+
+
+class TokenTrackingError(OdinLlmError):
+    """Erreur d'instrumentation tokens (§24, EC39).
+
+    Levee uniquement en configuration invalide (sink inconnu, etc.).
+    Jamais levee depuis un call LLM reussi (R28 — l'observabilite ne casse pas la prod).
+    """
