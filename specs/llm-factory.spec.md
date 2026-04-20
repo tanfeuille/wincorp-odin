@@ -1,7 +1,7 @@
 # wincorp_odin.llm — Specification (Phase 1.1 + 1.4 + 1.5 + 1.6 DeerFlow)
 
-> **Statut :** IMPLEMENTED (Phase 1.1 + 1.4-1.6 livrées + challenger adversarial v1.3.1 corrigé)
-> **Version :** 1.3.1
+> **Statut :** IMPLEMENTED (Phase 1.1 + 1.4-1.6 livrées + challenger adversarial v1.3.1 corrigé + Phase 1.9a SDK client)
+> **Version :** 1.3.2
 > **Niveau :** 3 (exhaustif)
 > **Auteur :** Tan Phi HUYNH (consolidation v1.2 + extensions §22-26 Phase 1.4-1.6)
 > **Date de création :** 2026-04-20
@@ -1317,6 +1317,46 @@ Le circuit breaker doit persister entre appels `create_model(name)` consécutifs
 
 ---
 
+## 27. SDK Anthropic client factory (Phase 1.9a)
+
+### 27.1 Objectif
+
+Fournir un second entry point, jumeau de `create_model()`, qui retourne **`anthropic.Anthropic`** (SDK brut) au lieu de **`ChatAnthropic`** (LangChain). Nécessaire pour les consommateurs qui utilisent directement l'API brute `client.messages.create(...)` — principalement `wincorp-heimdall` (5 services, 6 call sites : `extraction.py`, `categorization.py`, `chat_agent.py`, `ocr.py`, `pipeline_ocr.py`).
+
+**Rationale** : refactoriser heimdall pour passer par LangChain obligerait à revoir tous les patterns `response.content[0].text`, `response.usage.input_tokens`, `client.messages.create(tools=[...])`, tool-use loops etc. — effort disproportionné par rapport au gain immédiat (consolidation config YAML). L'option A (migration en 1 ligne) minimise le blast radius.
+
+### 27.2 Signature
+
+```python
+# src/wincorp_odin/llm/client.py
+def create_client(name: str) -> anthropic.Anthropic: ...
+```
+
+Charge `models.yaml` via `load_models_config()` (même mécanisme partagé — interpolation `${VAR}`, détection conflits OneDrive, schéma Pydantic). Valide que `use:` commence par `anthropic:` ou `langchain_anthropic:` (tous deux lisent `ANTHROPIC_API_KEY`). Instancie `anthropic.Anthropic(api_key=cfg.api_key_resolved)` — le SDK gère en interne son pool HTTP (httpx), donc **pas de cache côté odin** (KISS : cache prématuré = bug).
+
+### 27.3 Règles
+
+- **R29** — `create_client(name)` retourne une instance `anthropic.Anthropic` avec `api_key` issue de `models.yaml`. Pas de cache (instance neuve à chaque appel).
+
+### 27.4 Interactions absentes en Phase 1.9a
+
+- **Pas de middlewares** (breaker/retry/tokens). Ces wrappers sont couplés à `ChatAnthropic` et à l'interface LangChain (`invoke`, `usage_metadata`). Les consommateurs SDK brut qui veulent les middlewares migrent vers `create_model()` (Phase 1.9b, non planifiée). Justification : heimdall a ses propres try/except `anthropic.APIError` déjà en place, la robustesse n'est pas régressée.
+- **Pas de `thinking_enabled`** : thinking est un paramètre `messages.create(thinking={...})` côté consommateur, pas une propriété d'instanciation du SDK. Les consommateurs qui veulent thinking composent le payload eux-mêmes.
+
+### 27.5 Edge cases
+
+| # | Scénario | Comportement | Sévérité |
+|---|----------|--------------|----------|
+| EC42 | `create_client("xxx")` avec `xxx` inconnu | `ModelNotFoundError` FR + liste alpha des `name` disponibles (hors disabled) | RUNTIME |
+| EC43 | `use:` ne commence pas par `anthropic:` ou `langchain_anthropic:` | `CapabilityMismatchError` FR qui redirige vers `create_model()` | RUNTIME |
+| EC44 | `create_client("sonnet-disabled")` modèle `disabled: true` | Même UX que `create_model` : `ModelNotFoundError` (le modèle n'apparaît pas dans les disponibles) | RUNTIME |
+
+### 27.6 Export
+
+`create_client` est ré-exporté depuis `wincorp_odin.llm.__init__` (ajouté au `__all__`).
+
+---
+
 ## Changelog
 
 | Version | Date | Modification |
@@ -1326,9 +1366,10 @@ Le circuit breaker doit persister entre appels `create_model(name)` consécutifs
 | 1.2.0 | 2026-04-20 | 3 corrections structurelles post re-review adversarial (cf. §21) : (1) PB-019 budget runtime sous lock → copy-on-write avec R19b (§10.3 réécrit, nouveau budget runtime 500 ms, EC26, 2 nouveaux tests R19b) ; (2) retrait R16 timeout parsing YAML non-interrompable portable (§19.4 justification, EC24 reformulé) ; (3) R17 bifurqué dev vs installed avec env var obligatoire en installed (EC27, helper `_assert_under_allowed_root`, 3 nouveaux tests R17). Interface publique inchangée. |
 | 1.3.0 | 2026-04-20 | **Extensions Phase 1.4-1.6 DeerFlow middlewares** : §22 Circuit breaker (états CLOSED/HALF_OPEN/OPEN, thread-safe, `CircuitOpenError`, R20-R22b, EC28-32) · §23 Retry exponentiel + Retry-After parsing (R23-R25, `RetryExhaustedError`, EC33-36) · §24 Token tracking (dataclass `TokenUsageEvent`, sinks log/file/supabase-stub, `TokenTrackingError`, R26-R28, EC37-41) · §25 Intégration factory (ordre wrappers raw→tokens→retry→breaker, params `with_*`, cache 5-tuple, registre breakers) · §26 14 nouveaux edge cases · models.yaml : ajout champs optionnels `circuit_breaker`, `retry`, `pricing` par modèle (tarifs Anthropic avril 2026). Interface Phase 1.1 rétrocompatible via params défaut. |
 | 1.3.1 | 2026-04-20 | **6 corrections post challenger adversarial v1.3** : (PR-013) `__setattr__` délégation sur 3 wrappers (fix AttributeError slots avec assignations LangChain type `model.callbacks = [...]`) · (PR-014) docstrings FR explicitant lecture hors-lock best-effort sur `_breaker_instances` + `CircuitBreaker.state/failure_count` · (PR-015) `FileSink.__init__` mkdir try/except fallback warning (respect R28 swallow sink errors) · (PR-016) probe HALF_OPEN ne consomme pas max_attempts retry — `RetryWrapper` accepte `breaker_ref` optionnel et check `state == HALF_OPEN` avant chaque attempt (factory réorganise ordre création) · (PR-018) `RetryConfig.__post_init__` validation `max_attempts >= 1`, `base_delay_sec > 0`, `cap_delay_sec >= base_delay_sec` (fix bug latent `max_attempts=0`) · (PR-019) migration `threading.local()` → `contextvars.ContextVar` pour compatibilité asyncio Phase 2 (fallback thread-local conservé pour compat test). Tests : 179 → 196 (+17). 100% branch coverage maintenu. |
+| 1.3.2 | 2026-04-20 | **Phase 1.9a — SDK Anthropic client factory** : ajout §27 (`create_client(name) -> anthropic.Anthropic`) second entry point de la factory partageant `models.yaml` avec `create_model()`. Motivation : migration `wincorp-heimdall` (5 services `extraction/categorization/chat_agent/ocr/pipeline_ocr`, 6 call sites) de `anthropic.Anthropic(api_key=settings.anthropic_api_key)` vers `create_client("claude-sonnet")`. Pas de cache, pas de middlewares, pas de thinking (voir §27.4). R29 + EC42-44. Interface `create_model()` inchangée. Tests 196 → 204 (+8). 100% branch coverage maintenu. |
 
 ---
 
 ## @spec
 
-`@spec specs/llm-factory.spec.md v1.3` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.
+`@spec specs/llm-factory.spec.md v1.3.2` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.

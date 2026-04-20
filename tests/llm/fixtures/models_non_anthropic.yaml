@@ -1,0 +1,36 @@
+config_version: 1
+source: "Tests non-Anthropic (create_client rejection)"
+maintainer: "Test HUYNH"
+updated: "2026-04-20"
+
+defaults:
+  timeout: 60.0
+  max_retries: 0
+  supports_vision: false
+  supports_reasoning_effort: false
+
+models:
+  - name: "sonnet"
+    display_name: "Claude Sonnet 4.5"
+    use: "langchain_anthropic:ChatAnthropic"
+    model: "claude-sonnet-4-5-20250929"
+    api_key: "${ANTHROPIC_API_KEY}"
+    max_tokens: 8192
+    supports_thinking: false
+
+  - name: "deepseek-v3"
+    display_name: "DeepSeek V3 (fictif — test capability mismatch)"
+    use: "langchain_deepseek:ChatDeepSeek"
+    model: "deepseek-chat"
+    api_key: "${DEEPSEEK_API_KEY}"
+    max_tokens: 4096
+    supports_thinking: false
+
+  - name: "sonnet-disabled"
+    display_name: "Claude Sonnet disabled (test)"
+    use: "langchain_anthropic:ChatAnthropic"
+    model: "claude-sonnet-4-5-20250929"
+    api_key: "${ANTHROPIC_API_KEY}"
+    max_tokens: 8192
+    supports_thinking: false
+    disabled: true
