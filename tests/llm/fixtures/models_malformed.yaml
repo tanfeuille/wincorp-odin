@@ -1,0 +1,9 @@
+config_version: 1
+source: "Tests malformed"
+models:
+  - name: "broken"
+    display_name: "Modele incomplet"
+    model: "claude-sonnet-4-5-20250929"
+    api_key: "${ANTHROPIC_API_KEY}"
+    max_tokens: 8192
+    supports_thinking: false

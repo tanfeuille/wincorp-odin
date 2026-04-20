@@ -313,7 +313,8 @@ wincorp-odin/src/wincorp_odin/llm/
 - **R9** — Typage retour `-> ChatAnthropic` strict en Phase 1.1. Relaxation vers `-> BaseChatModel` en Phase 1.2.
 - **R10** — Interpolation `api_key_resolved` **jamais loggée, jamais sérialisée, jamais présente dans `repr()`**. `ModelConfig.__repr__` override explicite (cf. §3.3).
 - **R10b** — `_build_kwargs` strip l'`api_key` des traces d'exception : tout `except` qui ré-émet en wrap reconstruit `args` sans la valeur de la clé.
-- **R10c** — `ModelAuthenticationError.__init__` nettoie `args` (match regex `r"sk-ant-[A-Za-z0-9_\-]{20,}"` remplacé par `***REDACTED***`) ET la chaîne `__cause__` (récurre sur `e.__cause__.args` tant que non-None).
+- **R10c** — `ModelAuthenticationError.__init__` nettoie `args` (via regex `_API_KEY_PATTERN` cf. R10d) ET la chaîne `__cause__` (récurre sur `e.__cause__.args` tant que non-None).
+- **R10d** — `_API_KEY_PATTERN` couvre **plusieurs providers** : Anthropic (`sk-ant-*`, `sk-ant-apiNN-*`), OpenAI project (`sk-proj-*`), OpenAI/DeepSeek générique (`sk-*` 32+ chars hex), AWS (`AKIA*` + 16 hex). Tout nouveau provider **doit ajouter son pattern ici avant Phase 1.x** (défense en profondeur — sans ça, une clé DeepSeek leakée au 1er call Phase 1.2 traverserait `__cause__`).
 - **R11** — Modèle `disabled: true` exclu du cache et ignoré par `create_model` (lève `ModelNotFoundError` même si le bloc existe). Usage vs commentaire YAML : `disabled: true` conserve la validation syntaxique et permet de réactiver par patch minimal ; commenter un bloc perd cette garantie.
 - **R12** — `config_version` non supportée → `ModelConfigError` avec suggestion de migration.
 - **R13 — Whitelist `extra_kwargs` stricte par provider** :
