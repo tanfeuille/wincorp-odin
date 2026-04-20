@@ -1,9 +1,9 @@
 # wincorp_odin.llm — Specification (Phase 1.1 DeerFlow)
 
-> **Statut :** DRAFT (post review adversarial — prêt build)
-> **Version :** 1.1.0
+> **Statut :** DRAFT (post re-review adversarial — prêt build)
+> **Version :** 1.2.0
 > **Niveau :** 3 (exhaustif)
-> **Auteur :** Tan Phi HUYNH (consolidation 3 specs SDD Opus + 8 arbitrages review adversarial + 15 correctifs PB-001→PB-015)
+> **Auteur :** Tan Phi HUYNH (consolidation 3 specs SDD Opus + 8 arbitrages review adversarial + 15 correctifs PB-001→PB-015 + 3 correctifs structurels PB-019 / points ouverts 1 et 2)
 > **Date de création :** 2026-04-20
 > **@plan** `memory/project_deerflow_inspiration_plan.md` Phase 1.1
 > **Nom logique** : `wincorp_odin.llm` (pas d'alias `mimir.llm` — isolation dure Odin↔Mimir)
@@ -277,7 +277,7 @@ models:
 wincorp-odin/src/wincorp_odin/llm/
 ├── __init__.py          # Ré-exports publics uniquement (cf. §3.1)
 ├── config.py            # Pydantic BaseModel ModelsFile + ModelConfig + loader YAML + interpolation ${VAR}
-│                        # + vérification taille max (R15) + safe_load strict (R14) + timeout parse (R16)
+│                        # + vérification taille max (R15) + safe_load strict (R14)
 ├── factory.py           # create_model + validate_all_models + _reload_for_tests + cache + Lock
 ├── _registry.py         # resolve_class("pkg.module:Classe") via importlib — PRIVÉ, cache classe
 ├── _whitelist.py        # PRIVÉ — tables de whitelist extra_kwargs par provider (R13)
@@ -323,27 +323,31 @@ wincorp-odin/src/wincorp_odin/llm/
   - À la validation schéma, tout `extra_kwargs` contenant une clé hors whitelist → `ExtraKwargsForbiddenError`.
   - Si `use:` pointe vers un provider inconnu dans la table → whitelist vide → `extra_kwargs` doit être `{}` ou `ExtraKwargsForbiddenError`.
 - **R14 — YAML safe_load obligatoire** : `config.py` utilise `yaml.safe_load()` exclusivement. Un appel à `yaml.load()` ou `yaml.unsafe_load()` est interdit — lint Ruff règle custom (ou commit-hook grep) à ajouter. Empêche l'exécution de tags `!!python/object` dans un YAML compromis (attack injection via URD contaminé).
-- **R15 — Taille max YAML 1 MB** : `Path.stat().st_size` vérifié **avant** `read_text()`. Si > 1 Mo → `ModelConfigError` FR « models.yaml > 1 Mo, suspicion fichier corrompu ou bourré de duplications ». Borne arbitraire mais très supérieure aux usages légitimes (~2 Ko pour 5-10 modèles).
-- **R16 — Timeout parsing YAML 2s** : portable multi-OS :
-  - Unix/macOS : `signal.alarm(2)` avec handler levant `TimeoutError`.
-  - Windows : fallback `threading.Timer(2.0, raise_in_thread)` — parsing dans un thread avec flag shared, raise post-parse si timeout atteint.
-  - Au déclenchement → `ModelConfigError` FR « Parsing models.yaml > 2s, fichier probablement malformé ».
-- **R17 — Path traversal contraint sur `WINCORP_URD_PATH`** :
-  - `Path(os.environ["WINCORP_URD_PATH"]).resolve(strict=True)` → résolution symlinks + existence.
-  - Doit être sous `Path.home().resolve()` OU sous `project_root` (détecté par remontée depuis `__file__` vers parent contenant `.git` ou `pyproject.toml`).
-  - Sinon → `ModelConfigError` générique FR **sans exposer** le chemin tenté (message : « Le chemin WINCORP_URD_PATH est hors des racines autorisées. Vérifier la variable d'environnement. »). Le chemin est journalisé en DEBUG (log local uniquement) pour investigation par Tan.
+- **R15 — Taille max YAML 1 MB** : `Path.stat().st_size` vérifié **avant** `read_text()`. Si > 1 Mo → `ModelConfigError` FR « models.yaml > 1 Mo, suspicion fichier corrompu ou bourré de duplications ». Borne arbitraire mais très supérieure aux usages légitimes (~2 Ko pour 5-10 modèles). Voir §19 « Mitigation parsing » pour la justification de l'abandon d'un timeout parsing dédié.
+- **R17 — Résolution path URD bifurquée dev vs installed** :
+  - **Mode explicite** (`WINCORP_URD_PATH` env var définie) : `Path(env).resolve()` → passe par `_assert_under_allowed_root(resolved)` qui vérifie l'appartenance à `Path.home()` OU à `project_root` (remontée 10 parents depuis `__file__` cherchant `.git` ou `pyproject.toml`). Sinon → `ModelConfigError` FR **générique** sans exposer le chemin tenté. Retourne ensuite `resolved / "referentiels" / "models.yaml"`.
+  - **Mode implicite** (env var absente) : parcourt `Path(__file__).resolve().parents[:5]` à la recherche d'un ancêtre contenant `.git`. Si trouvé : dev local, ancêtre = `wincorp-odin/`, on remonte à `wincorp-dev/` et on tente `wincorp-urd/referentiels/models.yaml`. Si `.exists()` → OK. Sinon → break (ne pas dépasser l'ancêtre `.git`).
+  - **Installed sans env var** (pas de `.git` trouvé, pas d'env var) : `ModelConfigError` **FATAL startup** FR actionnable — `"WINCORP_URD_PATH obligatoire en déploiement installed. Définir la variable dans le .env du service (valeur = chemin absolu vers le dossier wincorp-urd/). Détection dev/prod : présence de .git dans les 5 parents."`
+  - **Plus de fallback silencieux vers `$HOME`** : v1.1 autorisait implicitement toute racine `$HOME` en l'absence de `.git`, ouvrant une surface d'attaque. v1.2 force l'explicite en mode installed.
+  - Helper `_assert_under_allowed_root(path: Path) -> None` : raise `ModelConfigError("Path hors racine autorisée")` **générique** (pas de révélation du path tenté). Chemin journalisé en DEBUG pour investigation Tan.
 - **R18 — mtime check throttled 1/s** :
   - Variable `_last_mtime_check: float` stocke `time.monotonic()` du dernier check.
   - Si `time.monotonic() - _last_mtime_check < 1.0` → skip `stat()`, retourne cache directement.
   - Sinon → `stat().st_mtime` + mise à jour `_last_mtime_check`.
   - Garantit max 1 `stat()` / seconde même sous burst `create_model`.
   - Alternative documentée (non retenue) : check mtime **uniquement au cache miss** — rejeté car rate le scénario multi-PC OneDrive où une édition est suivie de hits immédiats.
-- **R19 — Budget timeout `validate_all_models()`** :
+- **R19 — Budget timeout `validate_all_models()` startup** :
   - Env var `WINCORP_LLM_VALIDATE_TIMEOUT_S` (défaut 5.0, min 1.0, max 60.0, float).
   - Horloge `time.monotonic()` démarrée à l'entrée de `validate_all_models()`.
   - Étapes 1-7 de §9 (chemin, OneDrive, parse, structure, version, schéma, interpolation) : doivent toutes passer dans le budget. Si dépassement ici → `ModelConfigError` FR « Validation des étapes 1-7 > {budget}s ».
   - Étape 8 (résolution `use:`) : chaque `importlib.import_module` + `getattr` tente individuellement. Si le cumul dépasse le budget, les modèles non-résolus sont marqués `_use_resolution_deferred=True` + log WARNING FR « Résolution provider {use} sautée par timeout, vérifier au 1er appel ».
   - La résolution différée se déclenche au 1er `create_model("<ce_nom>")` — si elle échoue à ce moment-là → `ProviderNotInstalledError` comme en mode strict.
+- **R19b — Budget timeout `_load_and_validate_models()` runtime (reload mtime)** :
+  - Distincte de R19 : invalidation runtime ne doit **jamais** être aussi permissive que startup.
+  - Env var `WINCORP_LLM_VALIDATE_RUNTIME_TIMEOUT_S` (défaut **0.5**, min 0.1, max 5.0, float).
+  - Rationale : le reload runtime tourne sous pression utilisateur (thread `create_model` en attente). Un budget court évite qu'un YAML lent/buggué gèle la prod.
+  - En cas de dépassement (`TimeoutError`) OU d'erreur config (`ModelConfigError`) pendant un reload runtime : le cache **précédent est conservé**, WARNING FR loggué, pas de downtime (cf. EC26).
+  - L'invalidation est retentée au prochain `_check_mtime_and_invalidate()` après que le throttle R18 soit retombé (1 s).
 
 ---
 
@@ -374,8 +378,10 @@ wincorp-odin/src/wincorp_odin/llm/
 | EC21 | Modèle `disabled: true` + `create_model("ce-nom")` | `ModelNotFoundError` comme si absent (R11) | RUNTIME |
 | EC22 | `WINCORP_URD_PATH` pointe vers dossier inexistant | `ModelConfigError` FR distinguant env absente vs chemin invalide | FATAL startup |
 | EC23 | `extra_kwargs` contient clé hors whitelist (ex `base_url: "evil.com"`) | `ExtraKwargsForbiddenError` listant clés rejetées + whitelist applicable | FATAL startup |
-| EC24 | YAML > 1 Mo OU parsing > 2s OU tag `!!python/object` | `ModelConfigError` FR « fichier suspect — taille/temps/tag dangereux » — détaille quelle règle a déclenché (R14/R15/R16) | FATAL startup |
+| EC24 | YAML > 1 Mo OU tag `!!python/object` | `ModelConfigError` FR « fichier suspect — taille/tag dangereux » — détaille quelle règle a déclenché (R14/R15) | FATAL startup |
 | EC25 | `validate_all_models()` dépasse `WINCORP_LLM_VALIDATE_TIMEOUT_S` pendant résolution `use:` | Log WARNING FR par modèle différé, modèles critiques (flag futur) tombent en `ModelConfigError`. Aujourd'hui : tous modèles non résolus sont différés au 1er appel. | WARNING |
+| EC26 | Invalidation runtime (`_check_mtime_and_invalidate`) dépasse `WINCORP_LLM_VALIDATE_RUNTIME_TIMEOUT_S` OU lève `ModelConfigError` | Cache **précédent conservé**, WARNING FR loggué, pas de downtime. Retry automatique au prochain check throttlé 1 s (R18). | WARNING |
+| EC27 | Mode installed (pas de `.git` détectable) sans `WINCORP_URD_PATH` défini | `ModelConfigError` FATAL startup FR actionnable pointant la définition de la variable dans le `.env` du service. | FATAL startup |
 
 ---
 
@@ -418,10 +424,14 @@ Exécuté par `validate_all_models()` sous budget timeout (R19).
 
 ### 9.1 Ordre
 
-1. **Résolution du chemin** — `WINCORP_URD_PATH` env var → fallback `Path(__file__).parent.parent.parent.parent.parent / "wincorp-urd"` (remonte depuis `src/wincorp_odin/llm/factory.py`). Si aucun n'existe → `ModelConfigError` (EC1, EC22). Validation R17 appliquée (résolution + racine autorisée).
+1. **Résolution du chemin (R17)** — bifurcation explicite selon contexte :
+   - Si `WINCORP_URD_PATH` défini : `Path(env).resolve()` + `_assert_under_allowed_root(resolved)` ($HOME ou project_root détecté en remontant jusqu'à 10 parents cherchant `.git`/`pyproject.toml`). Si hors racine autorisée → `ModelConfigError` générique FR (aucun chemin révélé, log DEBUG local uniquement).
+   - Sinon, détection dev local : parcourir `Path(__file__).resolve().parents[:5]` à la recherche d'un ancêtre contenant `.git`. Si trouvé → `ancêtre.parent / "wincorp-urd" / "referentiels" / "models.yaml"` si existe, sinon break sans fallback.
+   - Sinon (installed sans env var) → `ModelConfigError` FATAL startup FR actionnable (EC27).
+   - Erreurs possibles : EC1 (fichier non trouvé), EC22 (env var pointe vers dossier inexistant), EC27 (installed sans env var).
 2. **Détection conflits OneDrive** — cf. §9.2 détail 4 patterns + regex.
 3. **Vérification taille** — `stat().st_size > 1_048_576` → `ModelConfigError` (R15, EC24).
-4. **Parsing YAML** — `yaml.safe_load()` sous timeout 2s (R14, R16). Erreur → `ModelConfigError` avec ligne/colonne (EC2) ou « timeout/safe_load violation » (EC24).
+4. **Parsing YAML** — `yaml.safe_load()` strict (R14). Erreur → `ModelConfigError` avec ligne/colonne (EC2) ou « safe_load violation » (EC24).
 5. **Structure racine** — présence clé `models`, liste non vide. Erreur → `ModelConfigError` (EC3).
 6. **Version de schéma** — `config_version` supportée. Erreur → `ModelConfigError` (EC19).
 7. **Schéma per-model** — Pydantic `ModelsFile` valide chaque bloc. **Agrégation** des erreurs (EC4, EC5, EC6).
@@ -467,10 +477,13 @@ import threading, time
 from pathlib import Path
 
 _cache: dict[tuple[str, bool], Any] = {}          # clé = (name, thinking_enabled)
-_cache_lock = threading.Lock()                     # protège écriture cache + mtime
+_cache_lock = threading.Lock()                     # protège swap atomique cache + configs + mtime
 _yaml_mtime: float | None = None                   # dernière mtime vue
 _last_mtime_check: float = 0.0                     # R18 throttle 1/s
-_resolved_configs: dict[str, ModelConfig] = {}     # post-validation
+_resolved_configs: dict[str, ModelConfig] = {}     # post-validation (swap atomique, cf. §10.3)
+_deferred_resolutions: set[str] = set()            # noms modèles à résoudre lazy (R19, EC25)
+_STARTUP_TIMEOUT_S: float = 5.0                    # R19 — override via WINCORP_LLM_VALIDATE_TIMEOUT_S
+_RUNTIME_TIMEOUT_S: float = 0.5                    # R19b — override via WINCORP_LLM_VALIDATE_RUNTIME_TIMEOUT_S
 ```
 
 ### 10.2 Clé de cache
@@ -479,38 +492,63 @@ _resolved_configs: dict[str, ModelConfig] = {}     # post-validation
 
 Rationale : tuples hashables nativement, pas de parsing de string, pas de risque de collision.
 
-### 10.3 Invalidation mtime (PB-003 + PB-010)
+### 10.3 Invalidation mtime — copy-on-write (PB-003 + PB-010 + PB-019)
 
-**Choix tranché** : check **throttled 1/s** via `_last_mtime_check` + **double-checked locking** sur la ré-acquisition de mtime dans le lock.
+**Choix tranché v1.2** : stratégie **copy-on-write** — validation **hors lock** (peut prendre plusieurs centaines de ms sous pression), swap atomique **sous lock court** (dict swap O(n) mais sans I/O).
 
-Rationale : O(1) `Path.stat().st_mtime` coût mesuré (cf. §19) négligeable en local, mais peut monter à ~10-50 μs sur OneDrive sync. Le throttle 1 Hz garantit max 1 `stat()` / seconde. Le double-checked locking garantit qu'aucune invalidation concurrente ne produit deux clears+reloads consécutifs.
+Rationale PB-019 : la v1.1 appelait `validate_all_models()` **sous** `_cache_lock`, détenant potentiellement le lock 5 s (budget R19 startup). Sous cette fenêtre, tous les threads `create_model` concurrents stallent. v1.2 sépare la phase lente (validation, I/O disque, résolution imports) de la phase atomique (swap des références de cache). Budget runtime distinct (R19b, défaut 500 ms) pour éviter qu'un YAML lent gèle la prod.
 
 ```python
 def _check_mtime_and_invalidate() -> None:
+    """Throttled mtime check + copy-on-write reload."""
     global _yaml_mtime, _last_mtime_check
     now = time.monotonic()
     # R18 — throttle : max 1 stat()/s
     if now - _last_mtime_check < 1.0:
         return
     _last_mtime_check = now
+
     yaml_path = _resolve_yaml_path()
     current = yaml_path.stat().st_mtime
     if _yaml_mtime is not None and current <= _yaml_mtime:
         return
-    # Candidat à invalidation — acquérir le lock puis re-stater (PB-003)
-    with _cache_lock:
-        current2 = yaml_path.stat().st_mtime                     # re-stat post-lock
-        if _yaml_mtime is not None and current2 <= _yaml_mtime:  # autre thread a déjà invalidé
-            return
-        logger.warning(
-            "models.yaml modifié (%s -> %s), invalidation cache LLM",
-            _yaml_mtime, current2,
+
+    # --- Reload HORS lock (peut prendre plusieurs centaines de ms) ---
+    try:
+        new_configs = _load_and_validate_models(
+            timeout_s=_RUNTIME_TIMEOUT_S,  # R19b, défaut 0.5s
         )
-        _cache.clear()
+    except (ModelConfigError, TimeoutError) as e:
+        # EC26 — cache conservé, pas de downtime
+        logger.warning(
+            "Invalidation mtime échouée (cache conservé, pas de downtime) : %s", e,
+        )
+        return
+
+    # --- Swap atomique SOUS lock court (double-check R7) ---
+    with _cache_lock:
+        current_reloaded = yaml_path.stat().st_mtime
+        if current_reloaded <= (_yaml_mtime or 0):
+            # Autre thread a déjà fait le swap, ou mtime est redescendu — abandon
+            return
+        logger.info(
+            "[INFO] models.yaml rechargé (mtime: %s -> %s)",
+            _yaml_mtime, current_reloaded,
+        )
         _resolved_configs.clear()
-        validate_all_models()       # re-run validation complète sous le même lock
-        _yaml_mtime = current2
+        _resolved_configs.update(new_configs)
+        _cache.clear()
+        _registry._class_cache.clear()
+        _deferred_resolutions.clear()
+        _yaml_mtime = current_reloaded
 ```
+
+**Invariants** :
+- Le lock n'est jamais détenu pendant I/O disque ni pendant `importlib.import_module`.
+- En cas d'échec du reload (timeout runtime, config invalide), `_resolved_configs` / `_cache` / `_yaml_mtime` restent **strictement inchangés**. Les threads concurrents continuent d'utiliser la config précédente.
+- Le `_last_mtime_check` est mis à jour **avant** la tentative de reload : un reload échoué re-déclenchera une tentative 1 s plus tard (throttle R18). Pas de retry serré.
+- `_load_and_validate_models()` est une variante interne de `validate_all_models()` qui **retourne** un `dict[str, ModelConfig]` frais sans muter l'état global (pur). `validate_all_models()` au startup appelle `_load_and_validate_models(timeout_s=_STARTUP_TIMEOUT_S)` puis mute l'état.
+- Distinction des budgets : `_STARTUP_TIMEOUT_S` = `WINCORP_LLM_VALIDATE_TIMEOUT_S` (R19, défaut 5 s) / `_RUNTIME_TIMEOUT_S` = `WINCORP_LLM_VALIDATE_RUNTIME_TIMEOUT_S` (R19b, défaut 0.5 s).
 
 ### 10.4 Double-checked locking pour instanciation
 
@@ -555,6 +593,7 @@ def _reload_for_tests() -> None:
         _cache.clear()
         _resolved_configs.clear()
         _registry._class_cache.clear()   # invalider aussi le cache classe (PB-012)
+        _deferred_resolutions.clear()    # v1.2 — purge résolution différée (R19)
         _yaml_mtime = None
         _last_mtime_check = 0.0
 ```
@@ -587,6 +626,8 @@ def _reload_for_tests() -> None:
 | 16 | `test_r7_double_checked_mtime_no_double_clear` | R7, PB-003 |
 | 17 | `test_r18_mtime_check_throttled` | R18, PB-010 |
 
+Note v1.2 : les 17 tests ordonnés ci-dessus restent numérotés à l'identique. Les 3 tests structurels ajoutés (R19b copy-on-write, R17 installed, R17 path traversal) vivent dans §11.2 (complémentaires, non-bloquants pour l'ordre TDD initial).
+
 ### 11.2 Tests complémentaires
 
 - `test_r7_concurrent_create_model_instantiates_once` (threading + `Barrier`)
@@ -599,9 +640,12 @@ def _reload_for_tests() -> None:
 - `test_r13_extra_kwargs_whitelist_accepts_temperature`
 - `test_r14_yaml_unsafe_tag_rejected` (ex `!!python/object`)
 - `test_r15_yaml_size_exceeds_1mb_rejected` (EC24)
-- `test_r16_yaml_parse_timeout` (EC24)
-- `test_r17_urd_path_traversal_rejected` (chemin hors `$HOME` + hors `project_root`)
+- `test_r17_urd_path_traversal_rejected` (chemin hors `$HOME` + hors `project_root`, message générique **sans** exposer le path)
+- `test_r17_installed_requires_env_var` (v1.2 — pas de `.git` détectable + pas de `WINCORP_URD_PATH` → `ModelConfigError` FATAL avec message FR actionnable, EC27)
+- `test_r17_dev_mode_autodetects_wincorp_dev` (v1.2 — `.git` présent dans un parent → trouve `../wincorp-urd/referentiels/models.yaml` sans env var)
 - `test_r19_validate_timeout_defers_use_resolution` (EC25)
+- `test_r19b_runtime_reload_copy_on_write_no_stall` (v1.2 — PB-019 : 2 threads, l'un déclenche invalidation lente via `_check_mtime_and_invalidate` sous `WINCORP_LLM_VALIDATE_RUNTIME_TIMEOUT_S=2.0` avec YAML ralenti artificiellement, l'autre appelle `create_model` concurrent → l'appel concurrent ne doit pas stall plus de 10 ms ; assertion via `time.monotonic()` avant/après)
+- `test_r19b_runtime_reload_failure_keeps_previous_cache` (v1.2 — EC26 : reload runtime échoue (timeout ou YAML invalide) → `_resolved_configs` précédent inchangé, WARNING loggué, `create_model` concurrent continue de fonctionner)
 - `test_reload_for_tests_clears_cache_and_registry` (PB-012)
 - `test_registry_cache_invalidated_by_reload` (PB-012)
 - `test_api_key_never_in_repr` (R10)
@@ -644,10 +688,11 @@ wincorp-odin/tests/llm/
 ```python
 @pytest.fixture(autouse=True)
 def _reset_factory_state(monkeypatch):
-    """Vide cache + mtime + registry cache entre chaque test (PB-012)."""
+    """Vide cache + mtime + registry cache + deferred resolutions entre chaque test (PB-012 + v1.2)."""
     from wincorp_odin.llm import factory, _registry
     factory._cache.clear()
     factory._resolved_configs.clear()
+    factory._deferred_resolutions.clear()   # v1.2 — purge état différé R19
     factory._yaml_mtime = None
     factory._last_mtime_check = 0.0
     _registry._class_cache.clear()
@@ -778,7 +823,9 @@ Déjà présentes dans `wincorp-odin/[project.optional-dependencies].dev` : `pyt
 13. **EC23** — `[ERREUR] Modèle 'custom' : extra_kwargs contient les clés interdites [base_url, api_key]. Provider langchain_anthropic:ChatAnthropic — whitelist : [temperature, top_p, top_k, stop_sequences, streaming]. Retirer les clés interdites.`
 14. **EC24** — `[ERREUR] models.yaml suspect — taille 2.3 Mo > 1 Mo autorisé. Vérifier le fichier (corruption, duplications ?).`
 15. **EC25** — `[WARN] Validation startup > 5s — résolution du provider 'langchain_custom:ChatCustom' sautée par timeout, sera réessayée au 1er create_model("custom"). Vérifier le démarrage au premier appel.`
-16. **R17** — `[ERREUR] Le chemin WINCORP_URD_PATH est hors des racines autorisées. Vérifier la variable d'environnement.` (**Aucune** information sur le chemin tenté — log DEBUG local uniquement.)
+16. **EC26** — `[WARN] Invalidation mtime échouée (cache conservé, pas de downtime) : <erreur>.` (v1.2 — reload runtime échoué, retry automatique au prochain throttle 1 s.)
+17. **EC27** — `[ERREUR] WINCORP_URD_PATH obligatoire en déploiement installed. Définir la variable dans le .env du service (valeur = chemin absolu vers le dossier wincorp-urd/). Détection dev/prod : présence de .git dans les 5 parents de <chemin module>.` (v1.2 — mode installed sans env var.)
+18. **R17** — `[ERREUR] Le chemin WINCORP_URD_PATH est hors des racines autorisées. Vérifier la variable d'environnement.` (**Aucune** information sur le chemin tenté — log DEBUG local uniquement.)
 
 ---
 
@@ -938,6 +985,16 @@ Section créée pour remplir les chiffres mesurés pendant l'implémentation (cf
 - Si `stat()` > 500 μs sur E3 (SSD VPS) — investiguer FS backing, envisager tmpfs cache ou `inotify`/`fsnotify` opt-in.
 - Si `validate_all_models()` > 2s avec < 20 modèles — profiler `importlib.import_module` (peut loader LangChain lourd en cascade).
 
+### 19.4 Mitigation parsing (v1.2 — R16 retiré)
+
+R15 (taille max 1 Mo via `Path.stat().st_size` **avant** parsing) couvre 99 % des cas pathologiques. Un parsing `yaml.safe_load` > 2s sans taille > 1 Mo est quasi-impossible sur un YAML bien formé — le parseur C natif traite ~50-100 Mo/s sur toute machine moderne.
+
+Le DoS volontaire par YAML **anchors/alias pathologiques** (« billion laughs », explosion exponentielle via anchors répétés) reste théoriquement possible **mais borné** par R15 : l'expansion s'arrête au plus tard quand le buffer intermédiaire dépasse la taille acceptable en RAM — un YAML source < 1 Mo ne peut pas produire une explosion de RAM significative sans lever `MemoryError` bien avant 2 s de CPU.
+
+R14 (`yaml.safe_load` obligatoire) protège contre les **constructeurs dangereux** (`!!python/object`, `!!python/module`, etc.). Les expansions d'anchors restent possibles mais bornées par R15.
+
+Le timeout parsing dédié (ex-R16) a été **retiré en v1.2** : la seule implémentation portable multi-OS (`signal.alarm` Unix + `threading.Timer` Windows) ne peut pas interrompre proprement un call C natif de `yaml.safe_load`. Le timeout Windows ne faisait que logguer post-parse sans arrêter quoi que ce soit — théâtre de garde-fou. R15 couvre le risque réel au bon niveau.
+
 ---
 
 ## 20. Changelog v1.0 → v1.1 — 15 corrections appliquées
@@ -950,8 +1007,8 @@ Section créée pour remplir les chiffres mesurés pendant l'implémentation (cf
 | PB-004 | MAJOR | Détection OneDrive sous-spécifiée | **APPLIQUÉ** — 4 patterns glob + regex fallback + prérequis §16 | §9.2, EC17, §16 |
 | PB-005 | MAJOR | `extra_kwargs` échappatoire | **APPLIQUÉ** — R13 whitelist stricte, `ExtraKwargsForbiddenError`, EC23, `_whitelist.py` | R13, §8, EC23, §5 |
 | PB-006 | MAJOR | Secrets dans logs/traces | **APPLIQUÉ** — `__repr__` override + R10b strip `_build_kwargs` + R10c nettoyage `__cause__` | R10/R10b/R10c, §3.3, §3.4 EC15 |
-| PB-007 | MAJOR | YAML injection | **APPLIQUÉ** — R14 `safe_load` + R15 taille max 1 Mo + R16 timeout 2s + EC24 | R14/R15/R16, EC24 |
-| PB-008 | MAJOR | Path traversal `WINCORP_URD_PATH` | **APPLIQUÉ** — R17 contrainte racine autorisée + message générique sans chemin tenté | R17, EC1, §14 msg R17 |
+| PB-007 | MAJOR | YAML injection | **APPLIQUÉ v1.1** — R14 `safe_load` + R15 taille max 1 Mo + R16 timeout 2s + EC24. **Révisé v1.2** : R16 retiré (cf. §19.4), R14 + R15 conservés | R14/R15, EC24, §19.4 |
+| PB-008 | MAJOR | Path traversal `WINCORP_URD_PATH` | **APPLIQUÉ v1.1** — R17 contrainte racine autorisée + message générique sans chemin tenté. **Renforcé v1.2** : R17 bifurqué dev (auto-détection `.git`) vs installed (env var obligatoire), suppression fallback silencieux vers `$HOME` | R17, EC1, EC27, §14 msg R17 |
 | PB-009 | MAJOR | Rétro-compat Phase 1.9 | **APPLIQUÉ** — §18 plan migration complet, wrapper `legacy.py`, liste repos priorisée | §18, §5 arbo, §2 note garantie |
 | PB-010 | MAJOR | Perf mtime sur OneDrive | **APPLIQUÉ** — R18 throttle 1/s + §19 benchmarks à compléter | R18, §10.3, §19, test 17 |
 | PB-011 | MAJOR | Héritage `KeyError`/`ValueError` | **APPLIQUÉ** — retrait héritages built-in, helpers `is_model_not_found`/`is_capability_mismatch`, renommage `MimirLlmError` → `OdinLlmError` | §8, helpers.py, §3.1 |
@@ -965,11 +1022,33 @@ Section créée pour remplir les chiffres mesurés pendant l'implémentation (cf
 - v1.0.0 : 713 lignes (estimation cat).
 - v1.1.0 : ~860 lignes (+21%). Augmentation concentrée §9.2 (conflits OneDrive détaillés), R10-R18-R19 (règles nouvelles), §13.0 (archi), §18 (plan migration), §19 (benchmarks), §20 (ce changelog).
 
-### Points laissés ouverts pour re-review (max 3)
+### Points laissés ouverts v1.1 — traités en v1.2
 
-1. **R16 timeout parsing portable** — implémentation `threading.Timer` Windows non testée sur environnements réels, fallback potentiellement instable si le YAML parsing ne peut pas être interrompu proprement mid-parse. À benchmarker au build, révision spec si échec.
-2. **R17 path traversal — détection `project_root`** — la remontée depuis `__file__` pour trouver `.git` ou `pyproject.toml` est fragile en contexte packaging installed (ex `pip install wincorp-odin` hors repo). Cas edge à trancher : site-packages doit-il autoriser n'importe quel `WINCORP_URD_PATH` sous `$HOME` ? Actuellement OUI, à reconsidérer si déploiement server-side.
-3. **R19 budget timeout + résolution différée** — le flag `_use_resolution_deferred=True` par modèle n'est pas propagé à `ModelConfig` (dataclass frozen). Soit ajouter un champ mutable (casse immutabilité), soit maintenir un registre séparé `_deferred_resolutions: set[str]`. Option B retenue tacitement — à confirmer au build.
+1. ~~**R16 timeout parsing portable**~~ — **RÉSOLU v1.2** : R16 retiré, mitigation basée sur R14+R15 documentée §19.4.
+2. ~~**R17 path traversal — détection `project_root`**~~ — **RÉSOLU v1.2** : R17 bifurqué dev (auto-détection `.git`) vs installed (env var **obligatoire**, pas de fallback `$HOME`). Message EC27 FR actionnable.
+3. **R19 budget timeout + résolution différée** — le flag `_use_resolution_deferred=True` par modèle n'est pas propagé à `ModelConfig` (dataclass frozen). **Confirmé v1.2** — option B retenue : registre séparé `_deferred_resolutions: set[str]` dans §10.1, purgé par `_reload_for_tests` et par le swap atomique §10.3.
+
+### Points ouverts traités post-v1.2
+
+Aucun — l'architecture copy-on-write (PB-019) a été appliquée, les 2 points ouverts v1.1 sont résolus.
+
+---
+
+## 21. Changelog v1.1 → v1.2 — 3 corrections structurelles post re-review
+
+| Issue | Sévérité | Titre | Statut v1.2 | Section modifiée |
+|-------|----------|-------|-------------|-------------------|
+| PB-019 | MAJOR | Budget re-validation runtime sous lock → stall 5 s potentiel | **APPLIQUÉ** — stratégie copy-on-write : validation hors lock, swap atomique sous lock court. Budget runtime distinct `WINCORP_LLM_VALIDATE_RUNTIME_TIMEOUT_S` (R19b, défaut 0.5 s) | §10.1 (structures + 2 budgets), §10.3 (pseudo-code complet copy-on-write), R19b (§6), EC26 (§7), §14 msg EC26, §11.2 tests R19b (2 nouveaux) |
+| Point ouvert #1 | MAJOR | R16 timeout parsing 2s non-interrompable portable | **APPLIQUÉ — retrait** — R16 supprimé (§6, §9 étape 4, §5 docstring config.py, §11.2 test retiré, EC24 reformulé). R15 (1 Mo) + R14 (safe_load) couvrent le risque réel. Justification §19.4 « Mitigation parsing » | §6 R16, §9.1 étape 4, §5, §11.2 test retiré, EC24, §19.4 (nouvelle section) |
+| Point ouvert #2 | MAJOR | R17 fragile en site-packages, fallback silencieux `$HOME` attack surface | **APPLIQUÉ** — R17 bifurqué : mode explicite `WINCORP_URD_PATH` (obligatoire installed) vs mode implicite dev (auto-détection `.git` dans 5 parents). Helper `_assert_under_allowed_root` générique. Message FR actionnable EC27 | §6 R17 (réécrit), §9.1 étape 1 (réécrit), EC27 (§7), §14 msg EC27, §11.2 tests R17 installed + dev + traversal |
+
+### Notes v1.2
+
+- Numérotation des 17 tests figés §11.1 **inchangée** — les 3 nouveaux tests R17/R19b vivent dans §11.2 (complémentaires). Aucune renumérotation nécessaire.
+- Structures `_deferred_resolutions: set[str]`, `_STARTUP_TIMEOUT_S`, `_RUNTIME_TIMEOUT_S` ajoutées §10.1.
+- `_reload_for_tests()` purge désormais `_deferred_resolutions` (§10.5).
+- Pas de rupture de contrat d'interface publique (§3.1 inchangée).
+- Un nouveau wrapper interne `_load_and_validate_models(timeout_s: float) -> dict[str, ModelConfig]` pur (sans mutation d'état) est introduit implicitement par §10.3 — doit être extrait de la logique `validate_all_models()` au build.
 
 ---
 
@@ -979,9 +1058,10 @@ Section créée pour remplir les chiffres mesurés pendant l'implémentation (cf
 |---------|------|--------------|
 | 1.0.0 | 2026-04-20 | Création initiale. Consolidation de 3 specs SDD Opus parallèles (archi / edge cases / testability). Review adversarial lancée. |
 | 1.1.0 | 2026-04-20 | 15 corrections PB-001→PB-015 appliquées post review adversarial. Déplacement `wincorp-mimir` → `wincorp-odin` (option B). `MimirLlmError` → `OdinLlmError`. Package `wincorp_odin.llm`. Sections nouvelles §13.0, §16 étendu, §18, §19, §20. 17 tests figés (15 + 2 nouveaux PB-003/PB-010). Spec prête build Phase 1.1. |
+| 1.2.0 | 2026-04-20 | 3 corrections structurelles post re-review adversarial (cf. §21) : (1) PB-019 budget runtime sous lock → copy-on-write avec R19b (§10.3 réécrit, nouveau budget runtime 500 ms, EC26, 2 nouveaux tests R19b) ; (2) retrait R16 timeout parsing YAML non-interrompable portable (§19.4 justification, EC24 reformulé) ; (3) R17 bifurqué dev vs installed avec env var obligatoire en installed (EC27, helper `_assert_under_allowed_root`, 3 nouveaux tests R17). Interface publique inchangée. |
 
 ---
 
 ## @spec
 
-`@spec specs/llm-factory.spec.md v1.1` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.
+`@spec specs/llm-factory.spec.md v1.2` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.
