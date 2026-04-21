@@ -1,6 +1,6 @@
 """Factory LLM : create_model + validate_all_models + cache thread-safe.
 
-@spec specs/llm-factory.spec.md v1.3
+@spec specs/llm-factory.spec.md v1.3.3
 
 Strategie copy-on-write PB-019 : validation hors lock, swap atomique sous
 lock court. Budgets startup (R19) et runtime (R19b) distincts.
@@ -8,6 +8,12 @@ lock court. Budgets startup (R19) et runtime (R19b) distincts.
 v1.3 : integration middlewares Phase 1.4/1.5/1.6 — params optionnels
 with_circuit_breaker / with_retry / with_token_tracking (§25).
 Ordre d'enveloppement (§25.1) : raw -> tokens -> retry -> breaker.
+
+v1.3.3 (Phase 1.7) : patch auto `stream_usage=True` dans `_build_kwargs` pour
+providers OpenAI-compat (`langchain_openai:`, `langchain_deepseek:`,
+`langchain_community:`) afin que les tokens soient captures en streaming.
+Override utilisateur respecte (si extra_kwargs.stream_usage deja defini).
+Anthropic non concerne (tokens inclus par defaut).
 """
 from __future__ import annotations
 
@@ -95,12 +101,31 @@ def _get_runtime_timeout() -> float:
 # Build kwargs (R10b — strip api_key des exceptions)
 # ---------------------------------------------------------------------------
 
+# Phase 1.7 — providers OpenAI-compat necessitant stream_usage=True pour
+# capturer les tokens en streaming. Anthropic non concerne (tokens inclus
+# par defaut).
+_OPENAI_COMPAT_PREFIXES = (
+    "langchain_openai:",
+    "langchain_deepseek:",
+    "langchain_community:",
+)
+
+
+def _is_openai_compat(use: str) -> bool:
+    """True si le provider est OpenAI-compatible (DeepSeek/Kimi/Ollama/vLLM)."""
+    return use.startswith(_OPENAI_COMPAT_PREFIXES)
+
 
 def _build_kwargs(cfg: ModelConfig, thinking_enabled: bool) -> dict[str, Any]:
     """Construit les kwargs d'instanciation du provider.
 
     Applique les overrides when_thinking_enabled/disabled selon le flag, et
     merge extra_kwargs deja whitelistes.
+
+    Phase 1.7 : auto-patch `stream_usage=True` pour providers OpenAI-compat
+    (cf `_OPENAI_COMPAT_PREFIXES`). Override utilisateur respecte : si
+    `extra_kwargs.stream_usage` est deja defini (meme False), la valeur user
+    prime.
     """
     kwargs: dict[str, Any] = {
         "model": cfg.model,
@@ -110,6 +135,10 @@ def _build_kwargs(cfg: ModelConfig, thinking_enabled: bool) -> dict[str, Any]:
         "max_retries": cfg.max_retries,
     }
     kwargs.update(cfg.extra_kwargs)
+
+    # Phase 1.7 — auto stream_usage pour OpenAI-compat si pas deja set par user.
+    if _is_openai_compat(cfg.use) and "stream_usage" not in cfg.extra_kwargs:
+        kwargs["stream_usage"] = True
 
     if thinking_enabled:
         overrides = cfg.when_thinking_enabled or {}

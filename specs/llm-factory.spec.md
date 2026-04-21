@@ -1213,7 +1213,7 @@ Pricing lu depuis `models.yaml` champ `pricing: {input_per_million_eur, output_p
 
 - **log** (défaut) — `logger.info("llm_usage_event", extra=event.to_json_dict())`. JSON sérialisé via formatter standard.
 - **file** — append JSONL dans `wincorp-odin/.token_usage/events.jsonl`. `threading.Lock` protège l'append. Dossier créé si absent. Override path via env var `WINCORP_LLM_TOKEN_SINK_FILE`.
-- **supabase** — stub Phase 1.6a : `NotImplementedError` FR claire. Implémentation Phase 1.6b (insert table `llm_usage` via heimdall API).
+- **supabase** — **Phase 1.6b (v1.3.3) — implémenté** : insert dans table `llm_usage` via PostgREST (`httpx` direct, pas de dep `supabase-py`). Env vars `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` obligatoires (ValueError FR au boot si absentes). Batching queue flush 5s ou 10 events. Erreurs réseau/HTTP swallowed (WARNING log, R28 — l'observabilité n'interrompt pas la prod). Flush final au `atexit` pour minimiser pertes.
 
 Sink factory : `get_sink(name: str) -> TokenSink`. Chaque sink implémente protocole `TokenSink.emit(event: TokenUsageEvent) -> None`.
 
@@ -1313,7 +1313,10 @@ Le circuit breaker doit persister entre appels `create_model(name)` consécutifs
 | EC38 | Pricing manquant dans YAML | WARNING FR + cost_eur=0.0 + event émis | WARNING |
 | EC39 | `WINCORP_LLM_TOKEN_SINK=inconnu` | `TokenTrackingError` au boot sink | FATAL |
 | EC40 | Sink file : écriture disque échoue | WARNING FR, pas d'exception au caller (observabilité n'interrompt pas la prod) | WARNING |
-| EC41 | Sink supabase utilisé Phase 1.6a | `NotImplementedError` FR claire « Phase 1.6b à venir, fallback sur sink=log » | FATAL au sink |
+| EC41 | Sink supabase sans env vars requises | `ValueError` FR au boot (`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` manquants) — fallback sink=log | FATAL au boot |
+| EC45 | Sink supabase : POST HTTP 4xx/5xx ou timeout | WARNING FR, batch perdu, pas de retry (observabilité n'interrompt pas la prod) | WARNING |
+| EC46 | Phase 1.7 — provider OpenAI-compat sans `stream_usage` explicite | Auto-set `stream_usage=True` dans kwargs (tokens captés en streaming) | — |
+| EC47 | Phase 1.7 — utilisateur fixe `extra_kwargs.stream_usage=False` | Valeur user respectée, pas d'override auto | — |
 
 ---
 
@@ -1367,9 +1370,10 @@ Charge `models.yaml` via `load_models_config()` (même mécanisme partagé — i
 | 1.3.0 | 2026-04-20 | **Extensions Phase 1.4-1.6 DeerFlow middlewares** : §22 Circuit breaker (états CLOSED/HALF_OPEN/OPEN, thread-safe, `CircuitOpenError`, R20-R22b, EC28-32) · §23 Retry exponentiel + Retry-After parsing (R23-R25, `RetryExhaustedError`, EC33-36) · §24 Token tracking (dataclass `TokenUsageEvent`, sinks log/file/supabase-stub, `TokenTrackingError`, R26-R28, EC37-41) · §25 Intégration factory (ordre wrappers raw→tokens→retry→breaker, params `with_*`, cache 5-tuple, registre breakers) · §26 14 nouveaux edge cases · models.yaml : ajout champs optionnels `circuit_breaker`, `retry`, `pricing` par modèle (tarifs Anthropic avril 2026). Interface Phase 1.1 rétrocompatible via params défaut. |
 | 1.3.1 | 2026-04-20 | **6 corrections post challenger adversarial v1.3** : (PR-013) `__setattr__` délégation sur 3 wrappers (fix AttributeError slots avec assignations LangChain type `model.callbacks = [...]`) · (PR-014) docstrings FR explicitant lecture hors-lock best-effort sur `_breaker_instances` + `CircuitBreaker.state/failure_count` · (PR-015) `FileSink.__init__` mkdir try/except fallback warning (respect R28 swallow sink errors) · (PR-016) probe HALF_OPEN ne consomme pas max_attempts retry — `RetryWrapper` accepte `breaker_ref` optionnel et check `state == HALF_OPEN` avant chaque attempt (factory réorganise ordre création) · (PR-018) `RetryConfig.__post_init__` validation `max_attempts >= 1`, `base_delay_sec > 0`, `cap_delay_sec >= base_delay_sec` (fix bug latent `max_attempts=0`) · (PR-019) migration `threading.local()` → `contextvars.ContextVar` pour compatibilité asyncio Phase 2 (fallback thread-local conservé pour compat test). Tests : 179 → 196 (+17). 100% branch coverage maintenu. |
 | 1.3.2 | 2026-04-20 | **Phase 1.9a — SDK Anthropic client factory** : ajout §27 (`create_client(name) -> anthropic.Anthropic`) second entry point de la factory partageant `models.yaml` avec `create_model()`. Motivation : migration `wincorp-heimdall` (5 services `extraction/categorization/chat_agent/ocr/pipeline_ocr`, 6 call sites) de `anthropic.Anthropic(api_key=settings.anthropic_api_key)` vers `create_client("claude-sonnet")`. Pas de cache, pas de middlewares, pas de thinking (voir §27.4). R29 + EC42-44. Interface `create_model()` inchangée. Tests 196 → 204 (+8). 100% branch coverage maintenu. |
+| 1.3.3 | 2026-04-20 | **Phases 1.6b + 1.7 livrées — fin Phase 1 DeerFlow** : (1.6b) `SupabaseSink` réel via httpx REST (PostgREST, pas de dep `supabase-py`), batching queue flush 5s/10 events, migration SQL `migrations/001_llm_usage.sql` (table `llm_usage` + 4 index), env vars `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` obligatoires, erreurs swallowed (R28), 5 tests. (1.7) Patch auto `stream_usage=True` pour providers OpenAI-compat (`langchain_openai:`, `langchain_deepseek:`, `langchain_community:`) dans `_build_kwargs`, override utilisateur respecté, 3 tests. Dépendance `httpx>=0.27.0` ajoutée. EC41 reformulé, EC45/46/47 ajoutés. Phase 1 totale livrée. |
 
 ---
 
 ## @spec
 
-`@spec specs/llm-factory.spec.md v1.3.2` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.
+`@spec specs/llm-factory.spec.md v1.3.3` — à ajouter en en-tête de chaque fichier source `src/wincorp_odin/llm/*.py` dès l'implémentation.

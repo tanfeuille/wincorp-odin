@@ -1,13 +1,19 @@
 """Token usage middleware : tracking input/output + cout EUR (Phase 1.6).
 
-@spec specs/llm-factory.spec.md v1.3 §24
+@spec specs/llm-factory.spec.md v1.3.3 §24
 
 Intercepte invoke/ainvoke, lit result.usage_metadata (contrat LangChain
-standard), emit vers un sink pluggable (log/file/supabase-stub).
+standard), emit vers un sink pluggable (log/file/supabase).
 Pricing depuis wincorp-urd/referentiels/models.yaml champ pricing: par modele.
+
+Phase 1.6b (v1.3.3) — SupabaseSink reel : insert dans table llm_usage via
+PostgREST (httpx direct, pas de dep supabase-py). Batching queue flush
+5s ou 10 events. Erreurs swallowed (R28 — observabilite ne casse pas le caller).
 """
 from __future__ import annotations
 
+import atexit
+import contextlib
 import json
 import logging
 import os
@@ -17,6 +23,8 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+import httpx
 
 from wincorp_odin.llm.exceptions import TokenTrackingError
 
@@ -125,13 +133,147 @@ class FileSink:
 
 
 class SupabaseSink:
-    """Stub Phase 1.6a — implementation Phase 1.6b (EC41)."""
+    """Sink Supabase reel (Phase 1.6b) — insert batch vers table llm_usage.
+
+    Architecture pragmatique : appel REST PostgREST direct via httpx (pas de
+    dep `supabase-py`). Ecritures en batch pour eviter de saturer le provider
+    LLM avec un POST reseau apres chaque invoke.
+
+    Env vars obligatoires :
+      - SUPABASE_URL
+      - SUPABASE_SERVICE_ROLE_KEY
+
+    Flush automatique :
+      - Toutes les `flush_interval_sec` secondes (defaut 5s) via timer daemon.
+      - Ou quand la queue atteint `batch_size` events (defaut 10).
+
+    R28 — les erreurs reseau/HTTP sont swallowed (WARNING log), le caller
+    n'est JAMAIS impacte. Un batch qui echoue est perdu, pas retente
+    (l'observabilite n'interrompt pas la prod).
+    """
+
+    DEFAULT_BATCH_SIZE = 10
+    DEFAULT_FLUSH_INTERVAL_SEC = 5.0
+    _HTTP_TIMEOUT_SEC = 5.0
+
+    def __init__(
+        self,
+        url: str | None = None,
+        service_role_key: str | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        flush_interval_sec: float = DEFAULT_FLUSH_INTERVAL_SEC,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        resolved_url = url if url is not None else os.environ.get("SUPABASE_URL")
+        resolved_key = (
+            service_role_key
+            if service_role_key is not None
+            else os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        )
+        if not resolved_url or not resolved_key:
+            raise ValueError(
+                "[ERREUR] SupabaseSink requiert SUPABASE_URL et "
+                "SUPABASE_SERVICE_ROLE_KEY. Variables d'environnement absentes. "
+                "Fallback : WINCORP_LLM_TOKEN_SINK=log (defaut) ou =file."
+            )
+        self._url = resolved_url.rstrip("/")
+        self._key = resolved_key
+        self._endpoint = f"{self._url}/rest/v1/llm_usage"
+        self._headers = {
+            "apikey": self._key,
+            "Authorization": f"Bearer {self._key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        self._batch_size = batch_size
+        self._flush_interval_sec = flush_interval_sec
+        self._queue: list[TokenUsageEvent] = []
+        self._lock = threading.Lock()
+        self._http = http_client if http_client is not None else httpx.Client(
+            timeout=self._HTTP_TIMEOUT_SEC
+        )
+        self._owns_http = http_client is None
+        self._stopping = False
+        # Timer daemon pour flush periodique.
+        self._timer: threading.Timer | None = None
+        self._schedule_timer()
+        # Best-effort flush a l'arret du process (event perdus sinon).
+        atexit.register(self._atexit_flush)
+
+    def _schedule_timer(self) -> None:
+        """Planifie un flush dans flush_interval_sec (thread daemon)."""
+        if self._stopping:
+            return
+        self._timer = threading.Timer(self._flush_interval_sec, self._timer_flush)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _timer_flush(self) -> None:
+        """Callback timer — flush puis reschedule."""
+        try:
+            self.flush()
+        finally:
+            self._schedule_timer()
+
+    def _atexit_flush(self) -> None:
+        """Flush final au shutdown process."""
+        self._stopping = True
+        if self._timer is not None:
+            self._timer.cancel()
+        self.flush()
+        if self._owns_http:
+            with contextlib.suppress(Exception):  # best-effort close shutdown
+                self._http.close()
+
+    def _event_to_payload(self, event: TokenUsageEvent) -> dict[str, Any]:
+        """Mappe TokenUsageEvent -> row llm_usage (timestamp ISO-8601 UTC)."""
+        iso_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(event.timestamp))
+        return {
+            "timestamp": iso_ts,
+            "model_name": event.model_name,
+            "session_id": event.session_id,
+            "agent_name": event.agent_name,
+            "client_id": event.client_id,
+            "input_tokens": event.input_tokens,
+            "output_tokens": event.output_tokens,
+            "total_tokens": event.total_tokens,
+            "cost_eur": event.cost_eur,
+        }
 
     def emit(self, event: TokenUsageEvent) -> None:
-        raise NotImplementedError(
-            "[ERREUR] SupabaseSink non implemente (Phase 1.6b a venir). "
-            "Fallback : definir WINCORP_LLM_TOKEN_SINK=log (defaut) ou =file."
-        )
+        """Enqueue l'event, flush si seuil batch_size atteint."""
+        with self._lock:
+            self._queue.append(event)
+            should_flush = len(self._queue) >= self._batch_size
+        if should_flush:
+            self.flush()
+
+    def flush(self) -> None:
+        """POST la queue vers Supabase. Swallow toute erreur (R28)."""
+        with self._lock:
+            if not self._queue:
+                return
+            pending = self._queue
+            self._queue = []
+        payload = [self._event_to_payload(e) for e in pending]
+        try:
+            resp = self._http.post(
+                self._endpoint, headers=self._headers, json=payload
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "[WARN] SupabaseSink HTTP %d : %s. Batch de %d events perdu.",
+                    resp.status_code,
+                    resp.text[:200],
+                    len(payload),
+                )
+        except (httpx.HTTPError, OSError) as e:
+            logger.warning(
+                "[WARN] SupabaseSink erreur reseau : %s. Batch de %d events perdu "
+                "(observabilite n'interrompt pas la prod).",
+                e,
+                len(payload),
+            )
 
 
 def get_sink(name: str | None = None) -> TokenSink:

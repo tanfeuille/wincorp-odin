@@ -1,6 +1,6 @@
-"""Tests token usage tracking (Phase 1.6).
+"""Tests token usage tracking (Phase 1.6 + 1.6b).
 
-@spec specs/llm-factory.spec.md v1.3 §24
+@spec specs/llm-factory.spec.md v1.3.3 §24
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from wincorp_odin.llm.exceptions import TokenTrackingError
@@ -183,19 +184,289 @@ def test_file_sink_write_error_swallowed(
     assert any("FileSink echec ecriture" in rec.message for rec in caplog.records)
 
 
-def test_supabase_sink_raises_not_implemented() -> None:
-    """EC41 : SupabaseSink stub -> NotImplementedError."""
-    sink = SupabaseSink()
-    evt = TokenUsageEvent(
-        timestamp=1.0,
-        model_name="sonnet",
-        input_tokens=0,
-        output_tokens=0,
-        total_tokens=0,
-        cost_eur=0.0,
+def _make_supabase_sink(
+    monkeypatch: pytest.MonkeyPatch,
+    http_client: httpx.Client | None = None,
+    batch_size: int = 10,
+    flush_interval_sec: float = 999.0,
+) -> SupabaseSink:
+    """Helper : SupabaseSink avec env vars + timer quasi desactive (999s)."""
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "test-service-key")
+    sink = SupabaseSink(
+        http_client=http_client,
+        batch_size=batch_size,
+        flush_interval_sec=flush_interval_sec,
     )
-    with pytest.raises(NotImplementedError):
-        sink.emit(evt)
+    # Annule immediatement le timer daemon pour eviter bruit/race en test.
+    if sink._timer is not None:
+        sink._timer.cancel()
+    return sink
+
+
+def _make_event(**overrides: Any) -> TokenUsageEvent:
+    """Helper : event par defaut."""
+    defaults: dict[str, Any] = {
+        "timestamp": 1700000000.0,
+        "model_name": "sonnet",
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 150,
+        "cost_eur": 0.001,
+        "session_id": "sess-1",
+        "agent_name": "brynhildr",
+        "client_id": "SPINEX",
+    }
+    defaults.update(overrides)
+    return TokenUsageEvent(**defaults)
+
+
+def test_supabase_sink_emit_posts_to_rest_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EC41 + §24.4 : emit -> POST PostgREST avec URL/headers/payload conformes."""
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, headers: dict[str, str], json: Any) -> Any:
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        resp = MagicMock()
+        resp.status_code = 201
+        return resp
+
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.side_effect = fake_post
+
+    # batch_size=1 -> flush immediat a l'emit
+    sink = _make_supabase_sink(monkeypatch, http_client=mock_client, batch_size=1)
+
+    evt = _make_event()
+    sink.emit(evt)
+
+    assert captured["url"] == "https://example.supabase.co/rest/v1/llm_usage"
+    assert captured["headers"]["apikey"] == "test-service-key"
+    assert captured["headers"]["Authorization"] == "Bearer test-service-key"
+    assert captured["headers"]["Content-Type"] == "application/json"
+    assert captured["headers"]["Prefer"] == "return=minimal"
+    payload = captured["json"]
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    row = payload[0]
+    assert row["model_name"] == "sonnet"
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 50
+    assert row["cost_eur"] == 0.001
+    # Timestamp ISO-8601 UTC
+    assert row["timestamp"].endswith("Z")
+
+
+def test_supabase_sink_missing_env_raises_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EC41 : env vars absentes -> ValueError FR actionnable au boot."""
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    with pytest.raises(ValueError) as excinfo:
+        SupabaseSink()
+    msg = str(excinfo.value)
+    assert "SUPABASE_URL" in msg
+    assert "SUPABASE_SERVICE_ROLE_KEY" in msg
+    # Fallback suggere
+    assert "WINCORP_LLM_TOKEN_SINK=log" in msg
+
+
+def test_supabase_sink_network_error_swallowed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """EC45 / R28 : erreur reseau -> WARNING, pas d'exception propagee."""
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.side_effect = httpx.ConnectError("connexion refusee")
+
+    sink = _make_supabase_sink(monkeypatch, http_client=mock_client, batch_size=1)
+
+    with caplog.at_level("WARNING", logger="wincorp_odin.llm.tokens"):
+        sink.emit(_make_event())  # Ne doit pas lever
+
+    assert any(
+        "SupabaseSink erreur reseau" in rec.message for rec in caplog.records
+    )
+
+
+def test_supabase_sink_http_error_swallowed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """EC45 : HTTP 4xx/5xx -> WARNING, pas d'exception."""
+    resp = MagicMock()
+    resp.status_code = 500
+    resp.text = "internal server error"
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.return_value = resp
+
+    sink = _make_supabase_sink(monkeypatch, http_client=mock_client, batch_size=1)
+
+    with caplog.at_level("WARNING", logger="wincorp_odin.llm.tokens"):
+        sink.emit(_make_event())
+
+    assert any(
+        "SupabaseSink HTTP 500" in rec.message for rec in caplog.records
+    )
+
+
+def test_supabase_sink_batch_flush_on_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batching : queue atteint batch_size -> flush automatique."""
+    resp = MagicMock()
+    resp.status_code = 201
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.return_value = resp
+
+    sink = _make_supabase_sink(monkeypatch, http_client=mock_client, batch_size=3)
+
+    # 2 emits : pas encore de flush
+    sink.emit(_make_event())
+    sink.emit(_make_event())
+    assert mock_client.post.call_count == 0
+
+    # 3e emit : flush
+    sink.emit(_make_event())
+    assert mock_client.post.call_count == 1
+    sent_payload = mock_client.post.call_args.kwargs["json"]
+    assert len(sent_payload) == 3
+
+
+def test_supabase_sink_flush_via_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flush par timer : 1 event puis flush() manuel simule le tick timer."""
+    resp = MagicMock()
+    resp.status_code = 201
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.return_value = resp
+
+    sink = _make_supabase_sink(
+        monkeypatch, http_client=mock_client, batch_size=100, flush_interval_sec=999.0
+    )
+
+    sink.emit(_make_event())  # 1 event < batch_size=100, pas de flush auto
+    assert mock_client.post.call_count == 0
+
+    # Simule le tick du timer en appelant flush() directement (equivalent
+    # fonctionnel, plus deterministe qu'un sleep reel).
+    sink.flush()
+    assert mock_client.post.call_count == 1
+
+    # Flush deuxieme fois sans events : no-op.
+    sink.flush()
+    assert mock_client.post.call_count == 1
+
+
+def test_supabase_sink_timer_reschedules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Le timer flush puis reschedule (boucle daemon)."""
+    resp = MagicMock()
+    resp.status_code = 201
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.return_value = resp
+
+    sink = _make_supabase_sink(
+        monkeypatch, http_client=mock_client, batch_size=100, flush_interval_sec=999.0
+    )
+
+    # Appel direct du callback timer (equivalent au tick) doit reprogrammer.
+    first_timer = sink._timer
+    sink._timer_flush()
+    assert sink._timer is not None
+    assert sink._timer is not first_timer
+    sink._timer.cancel()
+
+
+def test_supabase_sink_atexit_flush_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_atexit_flush : stoppe timer, flush queue restante, close http owne."""
+    resp = MagicMock()
+    resp.status_code = 201
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.return_value = resp
+
+    sink = _make_supabase_sink(monkeypatch, http_client=mock_client, batch_size=100)
+
+    sink.emit(_make_event())
+    sink.emit(_make_event())
+    assert mock_client.post.call_count == 0
+
+    sink._atexit_flush()
+    assert mock_client.post.call_count == 1
+    assert sink._stopping is True
+
+
+def test_get_sink_supabase_with_env_returns_real_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """env var supabase + env vars boot OK -> SupabaseSink instancie."""
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "test-key")
+    monkeypatch.setenv("WINCORP_LLM_TOKEN_SINK", "supabase")
+    sink = get_sink()
+    assert isinstance(sink, SupabaseSink)
+    if sink._timer is not None:
+        sink._timer.cancel()
+
+
+def test_supabase_sink_schedule_timer_noop_when_stopping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_schedule_timer : si _stopping=True, ne reprogramme pas (branche ligne 205)."""
+    mock_client = MagicMock(spec=httpx.Client)
+    sink = _make_supabase_sink(monkeypatch, http_client=mock_client)
+
+    sink._stopping = True
+    sink._timer = None
+    sink._schedule_timer()
+    # Pas de nouveau timer planifie.
+    assert sink._timer is None
+
+
+def test_supabase_sink_atexit_flush_handles_none_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_atexit_flush : timer deja None -> pas de crash (branche 220->222)."""
+    resp = MagicMock()
+    resp.status_code = 201
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.return_value = resp
+
+    sink = _make_supabase_sink(monkeypatch, http_client=mock_client)
+
+    # Simule un timer deja annule/libere
+    sink._timer = None
+    # Ne doit pas crash
+    sink._atexit_flush()
+    assert sink._stopping is True
+
+
+def test_supabase_sink_owns_http_closes_on_atexit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_atexit_flush : si http_client owne, close() appele (couverture 224-225)."""
+    # Pas de http_client injecte -> sink en cree un owne.
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "test-key")
+    sink = SupabaseSink(flush_interval_sec=999.0)
+    if sink._timer is not None:
+        sink._timer.cancel()
+    assert sink._owns_http is True
+
+    # Remplace le client par un mock qu'on pourra verifier.
+    mock_http = MagicMock(spec=httpx.Client)
+    sink._http = mock_http
+
+    sink._atexit_flush()
+    mock_http.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +488,17 @@ def test_r28_get_sink_explicit_file(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert isinstance(sink, FileSink)
 
 
-def test_r28_get_sink_env_supabase_returns_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Env var supabase -> SupabaseSink stub."""
+def test_r28_get_sink_env_supabase_returns_real_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 1.6b : env var supabase + env vars boot -> SupabaseSink reel."""
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "test-key")
     monkeypatch.setenv("WINCORP_LLM_TOKEN_SINK", "supabase")
     sink = get_sink()
     assert isinstance(sink, SupabaseSink)
+    if sink._timer is not None:
+        sink._timer.cancel()
 
 
 def test_r28_get_sink_invalid_raises(monkeypatch: pytest.MonkeyPatch) -> None:
