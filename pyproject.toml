@@ -20,8 +20,11 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["wincorp_odin"]
 package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["wincorp_odin*"]
 
 [project.optional-dependencies]
 dev = [
