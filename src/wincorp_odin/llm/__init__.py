@@ -36,7 +36,11 @@ from wincorp_odin.llm.exceptions import (
     TokenTrackingError,
 )
 from wincorp_odin.llm.factory import create_model, validate_all_models
-from wincorp_odin.llm.helpers import is_capability_mismatch, is_model_not_found
+from wincorp_odin.llm.helpers import (
+    get_model_id,
+    is_capability_mismatch,
+    is_model_not_found,
+)
 from wincorp_odin.llm.retry import RetryConfig
 from wincorp_odin.llm.tokens import (
     PricingConfig,
@@ -59,6 +63,7 @@ __all__ = [
     "ProviderNotInstalledError",
     "SecretMissingError",
     "create_model",
+    "get_model_id",
     "is_capability_mismatch",
     "is_model_not_found",
     "load_models_config",
