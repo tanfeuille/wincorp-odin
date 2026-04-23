@@ -591,6 +591,9 @@ class SubagentExecutor:
             1. Transition PENDING -> RUNNING (sous entry._lock). Sinon sortie.
             2. sink.on_start(snapshot()) hors lock (R16).
             3. Schedule task dans exec_pool.
+               Si RuntimeError (shutdown survenu entre on_start et submit) ->
+               transition RUNNING -> CANCELLED, on_end appele (scope R16 respecte),
+               sortie sans await.
             4. _await_with_precedence -> (status, result, error).
             5. Transition RUNNING -> terminal (sous entry._lock), set _done_event.
             6. sink.on_end(snapshot()) hors lock (R16).
@@ -613,11 +616,28 @@ class SubagentExecutor:
             # 2 : on_start (R16 scope, EC25 KI/SystemExit propages).
             self._safe_sink_call(self._sink.on_start, entry)
 
-            # 3 : schedule task.
+            # 3 : schedule task. Race possible : shutdown() peut etre appele entre
+            # la transition RUNNING et submit() -> exec_pool deja ferme. On
+            # attrape RuntimeError (message varie selon CPython version) et
+            # transitionne proprement CANCELLED (R12 : shutdown force cancel sur
+            # RUNNING ; ici on ferme la boucle cote wrapper).
             assert self._exec_pool is not None
-            exec_future = self._exec_pool.submit(
-                task, initial_state, entry.cancel_event
-            )
+            try:
+                exec_future = self._exec_pool.submit(
+                    task, initial_state, entry.cancel_event
+                )
+            except RuntimeError:
+                # shutdown survenu avant submit. RUNNING -> CANCELLED.
+                with entry._lock:
+                    entry.status = SubagentStatus.CANCELLED
+                    entry.error = (
+                        "[INFO] Annulee - executor shutdown avant demarrage "
+                        "exec_pool."
+                    )
+                    entry.completed_at = self._now_factory()
+                # R16 scope : RUNNING -> terminal -> on_end doit etre appele.
+                self._safe_sink_call(self._sink.on_end, entry)
+                return
 
             # 4 : await avec precedence.
             status, result, error = _await_with_precedence(

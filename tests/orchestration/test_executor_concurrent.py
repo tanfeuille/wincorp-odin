@@ -265,16 +265,31 @@ def test_ec19_submit_race_with_shutdown(
     frozen_now: Callable[[], datetime],
     uuid_factory_seq: Callable[[], str],
 ) -> None:
-    """EC19 : submit concurrent a shutdown -> soit submit OK soit Closed. Jamais crash."""
+    """EC19 : submit concurrent a shutdown -> soit submit OK soit Closed. Jamais crash.
+
+    Race forcee via `threading.Barrier(N+1)` : les N threads submit et le thread
+    principal (shutdown) se synchronisent sur la barrier avant leurs appels
+    respectifs, ce qui garantit une contention reelle sur `_state_lock` au lieu
+    d'un test ou le shutdown survient avant que les submits aient tente quoi que
+    ce soit.
+    """
     from wincorp_odin.orchestration.exceptions import SubagentExecutorClosedError
 
     ex = SubagentExecutor(
         _now_factory=frozen_now, _uuid_factory=uuid_factory_seq
     )
 
+    n_threads = 10
+    barrier = threading.Barrier(n_threads + 1, timeout=5.0)
     results: list[Any] = []
+    results_lock = threading.Lock()
 
     def do_submit() -> None:
+        # Synchronisation avec le thread principal : force la race.
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:  # pragma: no cover
+            return
         try:
             tid = ex.submit(
                 lambda s, e: 1,
@@ -282,16 +297,109 @@ def test_ec19_submit_race_with_shutdown(
                 timeout_sec=1.0,
                 trace_id="t",
             )
-            results.append(("ok", tid))
+            with results_lock:
+                results.append(("ok", tid))
         except SubagentExecutorClosedError:
-            results.append(("closed", None))
+            with results_lock:
+                results.append(("closed", None))
 
-    threads = [threading.Thread(target=do_submit) for _ in range(10)]
+    threads = [threading.Thread(target=do_submit) for _ in range(n_threads)]
     for t in threads:
         t.start()
+    # Rendez-vous : tous les submits et le shutdown partent ensemble.
+    barrier.wait()
     ex.shutdown(wait=True, cancel_futures=True, force_timeout_sec=None)
     for t in threads:
-        t.join(timeout=2.0)
+        t.join(timeout=5.0)
     # On a forcement une reponse par thread (pas de crash).
-    assert len(results) == 10
+    assert len(results) == n_threads
     assert all(r[0] in ("ok", "closed") for r in results)
+
+
+# --- CR-005/CR-006 wrapper handles exec_pool shutdown race ------------------
+
+
+def test_wrapper_handles_exec_pool_shutdown_race(
+    frozen_now: Callable[[], datetime],
+    uuid_factory_seq: Callable[[], str],
+) -> None:
+    """CR-005/006 : RuntimeError sur exec_pool.submit (shutdown survenu entre
+    on_start et submit) -> wrapper transitionne RUNNING -> CANCELLED proprement,
+    on_end appele (scope R16 respecte), status final CANCELLED avec error
+    contenant 'shutdown'.
+
+    Force la race via un sink `on_start` qui bloque sur une Barrier(2). Le thread
+    principal attend la barrier, patch exec_pool.submit pour raise RuntimeError,
+    libere le sink. Le wrapper reprend, appelle exec_pool.submit (patche) qui
+    raise -> branche CANCELLED exercee deterministiquement.
+    """
+    # Barrier(2) : test principal + wrapper (via sink on_start).
+    sink_barrier = threading.Barrier(2, timeout=5.0)
+    on_end_called = threading.Event()
+
+    class BlockingStartSink:
+        """on_start bloque sur la barrier jusqu'a ce que le test soit pret."""
+
+        def __init__(self) -> None:
+            self.started: list[Any] = []
+            self.ended: list[Any] = []
+
+        def on_start(self, result: Any) -> None:
+            self.started.append(result)
+            # Signale au test principal qu'on est en RUNNING ; attend son go.
+            with contextlib.suppress(threading.BrokenBarrierError):
+                sink_barrier.wait()
+
+        def on_end(self, result: Any) -> None:
+            self.ended.append(result)
+            on_end_called.set()
+
+    sink = BlockingStartSink()
+
+    ex = SubagentExecutor(
+        max_workers_scheduler=1,
+        max_workers_exec=1,
+        sink=sink,
+        _now_factory=frozen_now,
+        _uuid_factory=uuid_factory_seq,
+    )
+
+    def task(state: Any, cancel_event: threading.Event) -> str:
+        # Ne doit jamais etre execute : exec_pool.submit va raise.
+        return "ne-doit-pas-sortir"  # pragma: no cover
+
+    tid = ex.submit(task, initial_state={}, timeout_sec=5.0, trace_id="race")
+
+    # Attend que le wrapper ait transitionne RUNNING et appele on_start.
+    try:
+        sink_barrier.wait()
+    except threading.BrokenBarrierError:  # pragma: no cover
+        pytest.fail("Sink on_start n'a pas ete appele dans les temps")
+
+    # Patch exec_pool.submit pour simuler le shutdown race.
+    assert ex._exec_pool is not None
+
+    def _raise_shutdown(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    ex._exec_pool.submit = _raise_shutdown
+
+    # Libere le sink on_start -> le wrapper appelle exec_pool.submit (patche).
+    # La branche RuntimeError doit transitionner CANCELLED proprement.
+    res = ex.wait(tid, timeout=5.0)
+
+    assert res.status == SubagentStatus.CANCELLED, (
+        f"Status attendu CANCELLED, recu {res.status}"
+    )
+    assert res.error is not None and "shutdown" in res.error, (
+        f"Error attendu contenant 'shutdown', recu {res.error!r}"
+    )
+    assert res.completed_at is not None, "completed_at doit etre set"
+    assert res.started_at is not None, "started_at doit rester set (RUNNING traverse)"
+    # on_end doit avoir ete appele (R16 scope : RUNNING -> terminal).
+    assert on_end_called.is_set(), "on_end doit etre appele apres RUNNING -> terminal"
+    assert len(sink.ended) == 1
+    assert sink.ended[0].task_id == tid
+    assert sink.ended[0].status == SubagentStatus.CANCELLED
+
+    ex.shutdown(wait=True, cancel_futures=True, force_timeout_sec=None)
