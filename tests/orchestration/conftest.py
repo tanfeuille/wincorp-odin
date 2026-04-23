@@ -76,7 +76,7 @@ def executor(
     try:
         yield ex
     finally:
-        ex.shutdown(wait=True, cancel_futures=True, force_timeout_sec=0.5)
+        ex.shutdown(wait=True, cancel_futures=True, force_timeout_sec=None)
 
 
 @pytest.fixture

@@ -21,6 +21,7 @@ from wincorp_odin.orchestration.exceptions import (
     SubagentTaskIdConflictError,
     SubagentTaskNotFoundError,
 )
+from wincorp_odin.orchestration.executor import SubagentExecutor
 from wincorp_odin.orchestration.middleware import truncate_task_calls
 from wincorp_odin.orchestration.result import SubagentResult, SubagentStatus
 from wincorp_odin.orchestration.sinks import LogSink, SubagentSink
@@ -33,6 +34,7 @@ __all__ = [
     "LogSink",
     "SubagentCancelledException",
     "SubagentError",
+    "SubagentExecutor",
     "SubagentExecutorClosedError",
     "SubagentExecutorOverflowError",
     "SubagentResult",
