@@ -22,6 +22,7 @@ import logging
 import math
 import sys
 import threading
+import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -479,13 +480,21 @@ class SubagentExecutor:
                 frames = sys._current_frames()
                 for t in zombies:
                     tid = t.ident if t.ident is not None else 0
-                    stack = frames.get(tid, None)
+                    frame = frames.get(tid, None)
+                    if frame is not None:
+                        # traceback.format_stack retourne la liste
+                        # "file:line\n  code\n" sans exposer les locals.
+                        stack_text = "".join(traceback.format_stack(frame))
+                        if len(stack_text) > 500:
+                            stack_text = stack_text[:500] + "...<truncated>"
+                    else:
+                        stack_text = "<frame unavailable>"
                     logger.warning(
                         "shutdown: thread zombie '%s' ident=%s encore vivant "
-                        "(stack=%r) - Python ne permet pas de kill propre.",
+                        "(stack=%s) - Python ne permet pas de kill propre.",
                         t.name,
                         t.ident,
-                        stack,
+                        stack_text,
                     )
 
     def clear_history(self) -> int:

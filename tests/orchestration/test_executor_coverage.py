@@ -121,6 +121,149 @@ def test_zombie_thread_logged_warning(
     zombie_done.set()
 
 
+def test_zombie_thread_stack_short_no_truncation(
+    caplog: pytest.LogCaptureFixture,
+    frozen_now: Callable[[], datetime],
+    uuid_factory_seq: Callable[[], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CR-015 branche : stack <= 500 chars -> pas de troncature.
+
+    Complemente `test_zombie_thread_logged_warning` qui en pratique produit une
+    stack > 500 chars (plusieurs frames ThreadPoolExecutor). Ici on force une
+    stack courte pour exercer la branche `if len <= 500`.
+    """
+    from wincorp_odin.orchestration import executor as exec_mod
+
+    caplog.set_level(logging.WARNING, logger="wincorp_odin.orchestration.executor")
+
+    def _fake_format_stack(frame: Any = None) -> list[str]:
+        return ["short-stack\n"]
+
+    monkeypatch.setattr(exec_mod.traceback, "format_stack", _fake_format_stack)
+
+    ex = SubagentExecutor(
+        _now_factory=frozen_now,
+        _uuid_factory=uuid_factory_seq,
+    )
+    zombie_done = threading.Event()
+
+    def uncooperative(s: Any, e: threading.Event) -> None:
+        zombie_done.wait(0.5)
+        return None
+
+    ex.submit(uncooperative, initial_state={}, timeout_sec=10.0, trace_id="t")
+    ex.shutdown(wait=False, cancel_futures=True, force_timeout_sec=0.1)
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "zombie" in r.message
+    ]
+    assert any("short-stack" in r.getMessage() for r in warnings)
+    assert not any("<truncated>" in r.getMessage() for r in warnings), (
+        "La stack <= 500 chars ne doit PAS etre truncated"
+    )
+    zombie_done.set()
+
+
+def test_zombie_thread_stack_truncated_over_500_chars(
+    caplog: pytest.LogCaptureFixture,
+    frozen_now: Callable[[], datetime],
+    uuid_factory_seq: Callable[[], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CR-015 branche : stack > 500 chars -> truncation avec suffixe '<truncated>'.
+
+    On monkeypatche `traceback.format_stack` pour retourner une liste de frames
+    dont la concatenation depasse 500 chars, sans dependre de la profondeur
+    reelle de la pile du zombie.
+    """
+    import traceback as _tb_mod  # renomme pour eviter conflit local
+
+    from wincorp_odin.orchestration import executor as exec_mod
+
+    caplog.set_level(logging.WARNING, logger="wincorp_odin.orchestration.executor")
+
+    def _fake_format_stack(frame: Any = None) -> list[str]:
+        # 600 chars garantis.
+        return ["X" * 600]
+
+    monkeypatch.setattr(exec_mod.traceback, "format_stack", _fake_format_stack)
+
+    ex = SubagentExecutor(
+        _now_factory=frozen_now,
+        _uuid_factory=uuid_factory_seq,
+    )
+
+    zombie_done = threading.Event()
+
+    def uncooperative(s: Any, e: threading.Event) -> None:
+        zombie_done.wait(0.5)
+        return None
+
+    ex.submit(uncooperative, initial_state={}, timeout_sec=10.0, trace_id="t")
+    ex.shutdown(wait=False, cancel_futures=True, force_timeout_sec=0.1)
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "zombie" in r.message
+    ]
+    assert any("<truncated>" in r.getMessage() for r in warnings), (
+        "La troncature n'a pas ete appliquee malgre stack > 500 chars"
+    )
+    # Assure aussi que les locals ne fuitent pas : pas de 'repr(<frame object' dans log.
+    assert not any(
+        "<frame object at" in r.getMessage() for r in warnings
+    ), "repr(frame) ne doit plus fuir dans le log (CR-015)"
+
+    zombie_done.set()
+    # Tombstone cleanup
+    _ = _tb_mod  # silence unused import
+
+
+def test_zombie_thread_frame_unavailable_logged(
+    caplog: pytest.LogCaptureFixture,
+    frozen_now: Callable[[], datetime],
+    uuid_factory_seq: Callable[[], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CR-015 branche : frame None -> log '<frame unavailable>'.
+
+    Monkeypatch `sys._current_frames` pour qu'il renvoie un dict vide : le thread
+    zombie n'a pas de frame retrouvable. On verifie que le code prend la branche
+    'frame is None' sans lever.
+    """
+    from wincorp_odin.orchestration import executor as exec_mod
+
+    caplog.set_level(logging.WARNING, logger="wincorp_odin.orchestration.executor")
+
+    monkeypatch.setattr(exec_mod.sys, "_current_frames", lambda: {})
+
+    ex = SubagentExecutor(
+        _now_factory=frozen_now,
+        _uuid_factory=uuid_factory_seq,
+    )
+
+    zombie_done = threading.Event()
+
+    def uncooperative(s: Any, e: threading.Event) -> None:
+        zombie_done.wait(0.5)
+        return None
+
+    ex.submit(uncooperative, initial_state={}, timeout_sec=10.0, trace_id="t")
+    ex.shutdown(wait=False, cancel_futures=True, force_timeout_sec=0.1)
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "zombie" in r.message
+    ]
+    assert any("<frame unavailable>" in r.getMessage() for r in warnings), (
+        "La branche frame None doit produire '<frame unavailable>' dans le log"
+    )
+
+    zombie_done.set()
+
+
 def test_safe_sink_generator_exit_propagated(
     frozen_now: Callable[[], datetime],
     uuid_factory_seq: Callable[[], str],
