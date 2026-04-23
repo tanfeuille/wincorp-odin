@@ -1,10 +1,11 @@
 # orchestration — Specification
 
-> **Statut :** DRAFT
-> **Version :** 2.1
+> **Statut :** IMPLEMENTED
+> **Version :** 2.1.1
 > **Niveau :** 2 (standard)
 > **Auteur :** Tan Phi HUYNH
 > **Date de creation :** 2026-04-23
+> **Livraison :** 2026-04-23 branche `feat/orchestration` — 203 tests verts, 100% branch coverage, ruff + mypy strict clean.
 > **Changelog vs v2.0 :** 23 corrections post re-review adversariale #2 (5 bloquants, 11 majeurs, 7 mineurs). Voir §9.
 
 ---
