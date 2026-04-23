@@ -4,11 +4,15 @@
 
 ## ÉTAT DU PROJET
 
-**NOUVEAU 20/04/2026 soir**. Phase 0.5 du plan DeerFlow inspiration (`memory/project_deerflow_inspiration_plan.md`).
+Repo Yggdrasil Odin — orchestrateur LLM générique. Créé 20/04 pour isoler la dette LLM de `wincorp-mimir`.
 
-Repo créé pour isoler la dette LLM de `wincorp-mimir` qui doit rester librairie métier autonome (Pydantic seule dep externe, règle CLAUDE.md mimir ligne 49).
+**Phases livrées** :
+- **Phase 1 (20/04)** — llm factory, circuit breaker, retry, tokens middleware, SupabaseSink. 231 tests.
+- **Phase 4.1 (22/04)** — sandbox_audit classifier commandes bash (72 tests).
+- **Phase 6 partielle (22/04)** — messaging MessageBus + Telegram + WhatsApp (81 tests).
+- **Phase 2 (23/04)** — orchestration `SubagentExecutor` non-bloquant + `SubagentResult` frozen + `truncate_task_calls` + `build_initial_state`. 207 tests, 100% branch coverage (512 stmts, 186 branches). 3 passes adversariales sur spec, challenger post-build corrigé 2 races.
 
-**Statut** : skeleton initial, aucun module fonctionnel. Spec Phase 1 `specs/llm-factory.spec.md` à valider avant build.
+**Phase 2.8** (intégration thor Python — scénario X via heimdall REST proxy préconisé) et **Phase 2.9** (asyncio bridge) non-livrées, documentées spec §8.
 
 ## RÈGLES D'ISOLATION (DURES — NON NÉGOCIABLES)
 
@@ -20,11 +24,13 @@ Corollaire : un code métier qui a besoin d'un LLM → le consommateur (heimdall
 
 ## SCOPE (ce que le repo contient)
 
-- `wincorp_odin.llm` — factory providers LLM (`create_model`, `ModelConfig`, resolution `use:` path) — Phase 1 DeerFlow
-- `wincorp_odin.llm.circuit_breaker` — closed/half-open/open thread-safe — Phase 1.4
-- `wincorp_odin.llm.retry` — retry exponentiel + parsing Retry-After — Phase 1.5
-- `wincorp_odin.llm.tokens` — usage middleware + sink Supabase — Phase 1.6
-- `wincorp_odin.orchestration` — `SubagentStatus`, `SubagentResult`, `ThreadPoolExecutor`, truncation middleware — Phase 2 DeerFlow
+- `wincorp_odin.llm` — factory providers LLM (`create_model`, `ModelConfig`, resolution `use:` path)
+- `wincorp_odin.llm.circuit_breaker` — closed/half-open/open thread-safe
+- `wincorp_odin.llm.retry` — retry exponentiel + parsing Retry-After
+- `wincorp_odin.llm.tokens` — usage middleware + sink Supabase
+- `wincorp_odin.security.sandbox_audit` — classify bash commands (pattern DeerFlow SandboxAuditMiddleware)
+- `wincorp_odin.messaging` — MessageBus asyncio + TelegramChannel + WhatsAppChannel
+- `wincorp_odin.orchestration` — `SubagentStatus` / `SubagentResult` / `SubagentExecutor` / `build_initial_state` / `truncate_task_calls` / `SubagentSink` / `LogSink`. API non-bloquante. Spec v2.1.1.
 
 ## HORS SCOPE (ne jamais mettre ici)
 
