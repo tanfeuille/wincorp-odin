@@ -11,6 +11,7 @@ Repo Yggdrasil Odin — orchestrateur LLM générique. Créé 20/04 pour isoler 
 - **Phase 4.1 (22/04)** — sandbox_audit classifier commandes bash (72 tests).
 - **Phase 6 partielle (22/04)** — messaging MessageBus + Telegram + WhatsApp (81 tests).
 - **Phase 2 (23/04)** — orchestration `SubagentExecutor` non-bloquant + `SubagentResult` frozen + `truncate_task_calls` + `build_initial_state`. 207 tests, 100% branch coverage (512 stmts, 186 branches). 3 passes adversariales sur spec, challenger post-build corrigé 2 races.
+- **CR-024/CR-025 (24/04)** — shutdown polling deadline-based (early exit quand 0 task RUNNING) → bonus : tests force_timeout_*_clipped passent de ~5s chacun à 0.5s total. Spec v2.1.1 → v2.1.2. 2 tests régression ajoutés. 309 tests orchestration verts.
 - **Phase 3 (23/04)** — orchestration `valkyries` : `ValkyrieConfig` frozen hashable, `ValkyrieToolGuard` LangChain middleware, loader thread-safe double-check + atomic swap, `create_valkyrie_chat` factory. Spec v1.2 IMPLEMENTED. 87 tests (R1-R18, EC1-EC12), 100% branch coverage (324 stmts, 114 branches). Ruff clean, mypy strict clean. 1 skip EC7 Barrier scheduler-dependent Windows.
 
 **Phase 2.8** (intégration thor Python — scénario X via heimdall REST proxy préconisé) et **Phase 2.9** (asyncio bridge) non-livrées, documentées spec §8.
