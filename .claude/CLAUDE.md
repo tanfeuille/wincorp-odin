@@ -11,6 +11,7 @@ Repo Yggdrasil Odin — orchestrateur LLM générique. Créé 20/04 pour isoler 
 - **Phase 4.1 (22/04)** — sandbox_audit classifier commandes bash (72 tests).
 - **Phase 6 partielle (22/04)** — messaging MessageBus + Telegram + WhatsApp (81 tests).
 - **Phase 2 (23/04)** — orchestration `SubagentExecutor` non-bloquant + `SubagentResult` frozen + `truncate_task_calls` + `build_initial_state`. 207 tests, 100% branch coverage (512 stmts, 186 branches). 3 passes adversariales sur spec, challenger post-build corrigé 2 races.
+- **Phase 3 (23/04)** — orchestration `valkyries` : `ValkyrieConfig` frozen hashable, `ValkyrieToolGuard` LangChain middleware, loader thread-safe double-check + atomic swap, `create_valkyrie_chat` factory. Spec v1.2 IMPLEMENTED. 87 tests (R1-R18, EC1-EC12), 100% branch coverage (324 stmts, 114 branches). Ruff clean, mypy strict clean. 1 skip EC7 Barrier scheduler-dependent Windows.
 
 **Phase 2.8** (intégration thor Python — scénario X via heimdall REST proxy préconisé) et **Phase 2.9** (asyncio bridge) non-livrées, documentées spec §8.
 
@@ -31,6 +32,7 @@ Corollaire : un code métier qui a besoin d'un LLM → le consommateur (heimdall
 - `wincorp_odin.security.sandbox_audit` — classify bash commands (pattern DeerFlow SandboxAuditMiddleware)
 - `wincorp_odin.messaging` — MessageBus asyncio + TelegramChannel + WhatsAppChannel
 - `wincorp_odin.orchestration` — `SubagentStatus` / `SubagentResult` / `SubagentExecutor` / `build_initial_state` / `truncate_task_calls` / `SubagentSink` / `LogSink`. API non-bloquante. Spec v2.1.1.
+- `wincorp_odin.orchestration.valkyries` — `ValkyrieConfig` / `ValkyrieToolGuard` / `load_valkyrie` / `list_valkyries` / `validate_all_valkyries` / `create_valkyrie_chat`. Spec v1.2 IMPLEMENTED.
 
 ## HORS SCOPE (ne jamais mettre ici)
 
