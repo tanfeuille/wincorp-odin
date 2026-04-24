@@ -757,7 +757,7 @@ class TestEc2YamlMalformed:
 
         from wincorp_odin.orchestration.valkyries import ValkyrieConfigError, validate_all_valkyries
 
-        with pytest.raises(ValkyrieConfigError):
+        with pytest.raises(ValkyrieConfigError, match="YAML invalide"):
             validate_all_valkyries()
 
 
@@ -789,7 +789,7 @@ class TestEc3NoDefaults:
         mock_models_yaml: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Sans defaults, champ timeout_seconds absent → ValkyrieConfigError."""
+        """Sans defaults, champ timeout_seconds absent → ValkyrieConfigError mentionnant le champ."""
         yaml_content = """\
 config_version: 1
 valkyries:
@@ -807,7 +807,7 @@ valkyries:
 
         from wincorp_odin.orchestration.valkyries import ValkyrieConfigError, validate_all_valkyries
 
-        with pytest.raises(ValkyrieConfigError):
+        with pytest.raises(ValkyrieConfigError, match="timeout_seconds"):
             validate_all_valkyries()
 
 
@@ -842,7 +842,7 @@ valkyries: {}
         mock_models_yaml: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """valkyries: cle absente → ValkyrieConfigError."""
+        """valkyries: cle absente → ValkyrieConfigError mentionnant 'aucune valkyrie'."""
         yaml_content = """\
 config_version: 1
 source: "test"
@@ -853,7 +853,7 @@ source: "test"
 
         from wincorp_odin.orchestration.valkyries import ValkyrieConfigError, validate_all_valkyries
 
-        with pytest.raises(ValkyrieConfigError):
+        with pytest.raises(ValkyrieConfigError, match="aucune"):
             validate_all_valkyries()
 
 
@@ -868,7 +868,7 @@ class TestEc5ModelNull:
         mock_models_yaml: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """model: null → ValkyrieConfigError champ obligatoire."""
+        """model: null → ValkyrieConfigError mentionnant champ obligatoire 'model'."""
         yaml_content = """\
 config_version: 1
 valkyries:
@@ -887,7 +887,7 @@ valkyries:
 
         from wincorp_odin.orchestration.valkyries import ValkyrieConfigError, validate_all_valkyries
 
-        with pytest.raises(ValkyrieConfigError):
+        with pytest.raises(ValkyrieConfigError, match="obligatoire"):
             validate_all_valkyries()
 
 

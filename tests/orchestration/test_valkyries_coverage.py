@@ -254,7 +254,7 @@ valkyries:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Bloc valkyrie = valeur scalaire (pas dict) → ValkyrieConfigError."""
+        """Bloc valkyrie = valeur scalaire (pas dict) → ValkyrieConfigError mentionnant 'dict attendu'."""
         yaml_content = """\
 config_version: 1
 valkyries:
@@ -270,7 +270,7 @@ valkyries:
 
         from wincorp_odin.orchestration.valkyries import ValkyrieConfigError, validate_all_valkyries
 
-        with pytest.raises(ValkyrieConfigError):
+        with pytest.raises(ValkyrieConfigError, match="dict attendu"):
             validate_all_valkyries()
 
     def test_yaml_root_not_dict_raises(
@@ -463,7 +463,11 @@ class TestCheckMtimeBranches:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Si mtime n'a pas change entre la detection et le swap → pas de swap."""
+        """Si mtime n'a pas change entre detection et swap → pas de swap, cache intact.
+
+        Couvre la branche defensive : le 2eme stat (dans le lock) retourne
+        un mtime identique ou inferieur → swap annule pour eviter rechargement inutile.
+        """
         p = tmp_path / "valkyries.yaml"
         p.write_text(_VALID_YAML, encoding="utf-8")
         _patch_yaml_path(monkeypatch, p)
@@ -476,11 +480,10 @@ class TestCheckMtimeBranches:
         from wincorp_odin.orchestration.valkyries import load_valkyrie
 
         # 1er load
-        load_valkyrie("alpha")
-
-        # Simuler un mtime > _yaml_mtime pour trigger reload
-        # mais retourner le meme mtime dans le deuxieme stat (dans le lock)
+        cfg_before = load_valkyrie("alpha")
         original_yaml_mtime = valk_module._yaml_mtime
+        original_configs_id = id(valk_module._configs_ref)
+
         call_count = {"n": 0}
 
         class _FakePathSameMtime:
@@ -488,6 +491,8 @@ class TestCheckMtimeBranches:
                 call_count["n"] += 1
 
                 class _ST:
+                    # 1er stat : mtime > original → trigger reload
+                    # 2eme stat (dans lock) : mtime identique a original → swap annule
                     st_mtime = (original_yaml_mtime or 0.0) + (
                         1.0 if call_count["n"] == 1 else 0.0
                     )
@@ -507,14 +512,16 @@ class TestCheckMtimeBranches:
             lambda: _FakePathSameMtime(),  # type: ignore[return-value]
         )
 
-        # Reset throttle
+        # Reset throttle pour forcer le check
         with valk_module._cache_lock:
             valk_module._last_mtime_check = 0.0
 
-        # Appel : le 1er stat detecte une diff, mais le 2eme (dans le lock) = mtime identique
-        # → pas de swap (branche if _yaml_mtime is not None and current_reloaded <= _yaml_mtime)
-        load_valkyrie("alpha")
-        # Pas d'assertion forte ici, juste verifier pas de crash
+        # Le 1er stat detecte une diff, le 2eme (dans lock) = mtime identique → pas de swap
+        cfg_after = load_valkyrie("alpha")
+        # La config doit etre la meme (cache conserve, pas de swap)
+        assert cfg_after == cfg_before
+        # L'identite du dict de configs ne doit pas avoir change (pas de swap)
+        assert id(valk_module._configs_ref) == original_configs_id
 
 
 # ---------------------------------------------------------------------------
@@ -692,44 +699,46 @@ def _make_valkyrie_config(
 
 class TestToolGuardNonAIMessageBranches:
     def test_generate_non_aimessage_passthrough(self) -> None:
-        """Generation non-AIMessage → passe sans filtrage."""
+        """_generate : ChatGeneration avec non-AIMessage → passe tel quel (branche else).
+
+        Verifie que le contenu du HumanMessage retourne par le modele interne
+        est bien preserve inchange dans le ChatResult (pas de filtrage).
+        """
+        from langchain_core.messages import HumanMessage
+
         from wincorp_odin.orchestration.valkyries import ValkyrieToolGuard
 
         cfg = _make_valkyrie_config()
         inner = _ChatMessageGeneratingModel()
         guard = ValkyrieToolGuard(wrapped=inner, config=cfg)
 
-        result = guard.invoke("test")
-        # La reponse passe-through (HumanMessage -> garde tel quel)
-        assert result is not None
-
-    def test_agenerate_non_aimessage_passthrough(self) -> None:
-        """AGeneration non-AIMessage → passe sans filtrage."""
-        from wincorp_odin.orchestration.valkyries import ValkyrieToolGuard
-
-        cfg = _make_valkyrie_config()
-        inner = _ChatMessageGeneratingModel()
-        guard = ValkyrieToolGuard(wrapped=inner, config=cfg)
-
-        async def _run() -> Any:
-            return await guard.ainvoke("test")
-
-        result = asyncio.run(_run())
-        assert result is not None
+        # Appel direct _generate pour tester la branche else (non-AIMessage)
+        result = guard._generate([AIMessage(content="test")])
+        assert len(result.generations) == 1
+        # Le message retourne est un HumanMessage inchange (branche else → gen appende tel quel)
+        msg = result.generations[0].message
+        assert isinstance(msg, HumanMessage)
+        assert msg.content == "je suis humain"
 
     def test_stream_non_aimessagechunk_passthrough(self) -> None:
-        """Stream chunk avec content string → pass-through."""
+        """_stream : chunk AIMessageChunk avec content string → pass-through integral.
+
+        Verifie que le chunk string est emis inchange (branche isinstance(content, str)).
+        """
         from wincorp_odin.orchestration.valkyries import ValkyrieToolGuard
 
         cfg = _make_valkyrie_config()
         inner = _ChatMessageGeneratingModel()
         guard = ValkyrieToolGuard(wrapped=inner, config=cfg)
 
-        chunks = list(guard.stream("test"))
-        assert len(chunks) > 0
+        chunks = list(guard._stream([AIMessage(content="test")]))
+        assert len(chunks) == 1
+        # Content est une string → passe-through sans modification
+        assert isinstance(chunks[0].message, AIMessageChunk)
+        assert chunks[0].message.content == "string content simple"
 
     def test_astream_non_aimessagechunk_passthrough(self) -> None:
-        """AStream chunk avec content string → pass-through."""
+        """_astream : chunk AIMessageChunk avec content string → pass-through integral."""
         from wincorp_odin.orchestration.valkyries import ValkyrieToolGuard
 
         cfg = _make_valkyrie_config()
@@ -738,19 +747,21 @@ class TestToolGuardNonAIMessageBranches:
 
         async def _run() -> list[Any]:
             chunks = []
-            async for chunk in guard.astream("test"):
+            async for chunk in guard._astream([AIMessage(content="test")]):
                 chunks.append(chunk)
             return chunks
 
         chunks = asyncio.run(_run())
-        assert len(chunks) > 0
+        assert len(chunks) == 1
+        assert isinstance(chunks[0].message, AIMessageChunk)
+        assert chunks[0].message.content == "async string"
 
 
 class TestToolGuardNonAIMessageChunkStream:
     """Couvre les branches 'not isinstance(chunk.message, AIMessageChunk)'."""
 
     def test_stream_with_real_non_aimc_chunk(self) -> None:
-        """Chunk dont .message n'est pas AIMessageChunk → yield direct."""
+        """_stream/_astream : chunk dont .message n'est pas AIMessageChunk → yield direct inchange."""
         from langchain_core.messages import HumanMessageChunk
 
         from wincorp_odin.orchestration.valkyries import ValkyrieToolGuard
@@ -784,17 +795,23 @@ class TestToolGuardNonAIMessageChunkStream:
         inner = _NonAIMCModel()
         guard = ValkyrieToolGuard(wrapped=inner, config=cfg)
 
-        chunks = list(guard.stream("test"))
-        assert len(chunks) > 0
+        # _stream : non-AIMessageChunk → yield direct, contenu inchange
+        chunks = list(guard._stream([AIMessage(content="test")]))
+        assert len(chunks) == 1
+        assert isinstance(chunks[0].message, HumanMessageChunk)
+        assert chunks[0].message.content == "human chunk"
 
+        # _astream : meme logique
         async def _run() -> list[Any]:
             out = []
-            async for c in guard.astream("test"):
+            async for c in guard._astream([AIMessage(content="test")]):
                 out.append(c)
             return out
 
         achunks = asyncio.run(_run())
-        assert len(achunks) > 0
+        assert len(achunks) == 1
+        assert isinstance(achunks[0].message, HumanMessageChunk)
+        assert achunks[0].message.content == "human async"
 
 
 # ---------------------------------------------------------------------------
@@ -831,26 +848,34 @@ class TestLoadValkyrieFallbackLock:
 
         from wincorp_odin.orchestration.valkyries import load_valkyrie
 
-        with pytest.raises(ValkyrieNotFoundError):
+        with pytest.raises(ValkyrieNotFoundError, match="alpha"):
             load_valkyrie("alpha")
 
 
 # ---------------------------------------------------------------------------
-# _find_dev_urd_path : branche retour None si wincorp-urd absent
+# _find_dev_urd_path : branche True (candidate avec yaml existant) + env var
 # ---------------------------------------------------------------------------
 
 class TestFindDevUrdPath:
-    def test_find_dev_urd_path_no_git(
+    def test_find_dev_urd_path_returns_candidate_when_yaml_exists(
         self,
-        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """_find_dev_urd_path retourne None si pas de .git dans les parents."""
+        """_find_dev_urd_path : en env dev → retourne le Path wincorp-urd (branche True ligne 143-144).
+
+        Appelle _find_dev_urd_path() sans WINCORP_URD_PATH pour couvrir la branche
+        'if (candidate / referentiels / valkyries.yaml).exists() → return candidate'.
+        En mode dev wincorp-odin est frere de wincorp-urd (yaml present) : branche True.
+        En CI sans wincorp-urd : retourne None (branche False + pragma no cover ligne 145).
+        Les deux issues sont valides — ce test couvre la branche True en dev.
+        """
+        monkeypatch.delenv("WINCORP_URD_PATH", raising=False)
+
         from wincorp_odin.orchestration.valkyries import _find_dev_urd_path
 
-        # Appel direct — en dev le .git est la, donc on teste juste que ca ne crashe pas
         result = _find_dev_urd_path()
-        # Peut retourner Path ou None selon l'environnement
+        # En dev : Path vers wincorp-urd (branche True couverte)
+        # En CI sans wincorp-urd : None (branche False, ligne 145 pragma no cover)
         assert result is None or isinstance(result, Path)
 
     def test_env_var_has_precedence_over_autodetect(
@@ -990,7 +1015,11 @@ class TestLoadValkyrieGilBranches:
 
 class TestFilterContentBlockNonDict:
     def test_filter_non_dict_block_passthrough(self) -> None:
-        """_filter_content_block avec bloc non-dict → retourne tel quel."""
+        """Bloc non-dict dans content list → pass-through integral via invoke/stream API publique.
+
+        Utilise guard.invoke() et guard.stream() (API publique) plutot que _generate/_stream
+        directs, pour tester le comportement observable et pas l'implementation interne.
+        """
         from wincorp_odin.orchestration.valkyries import ValkyrieToolGuard
 
         cfg = _make_valkyrie_config(blocked_tools=["task"])
@@ -1022,21 +1051,28 @@ class TestFilterContentBlockNonDict:
         inner = _SimpleMockInner()
         guard = ValkyrieToolGuard(wrapped=inner, config=cfg)
 
-        # _generate avec bloc non-dict dans content list
-        result = guard._generate([AIMessage(content="test")])
-        assert len(result.generations) == 1
-        content = result.generations[0].message.content
-        # "texte string direct" doit passer inchange
+        # Via invoke() : bloc non-dict passe inchange dans le contenu
+        result = guard.invoke("test")
+        assert isinstance(result, AIMessage)
+        content = result.content
+        assert isinstance(content, list)
+        # "texte string direct" doit etre preserve tel quel
         assert "texte string direct" in content
 
-        # _stream avec bloc non-dict
-        chunks = list(guard._stream([AIMessage(content="test")]))
+        # Via stream() : chunks contenant bloc non-dict emis correctement
+        chunks = list(guard.stream("test"))
         assert len(chunks) > 0
+        all_content: list[Any] = []
+        for c in chunks:
+            if isinstance(c.content, list):
+                all_content.extend(c.content)
+        # "non_dict_element" doit passer inchange
+        assert "non_dict_element" in all_content
 
-        # _astream avec bloc non-dict
+        # Via astream() : idem
         async def _run_astream() -> list[Any]:
             out = []
-            async for c in guard._astream([AIMessage(content="test")]):
+            async for c in guard.astream("test"):
                 out.append(c)
             return out
 
@@ -1093,35 +1129,6 @@ class TestStreamNonAIMessageChunkBranch:
         achunks = asyncio.run(_run())
         assert len(achunks) == 1
 
-
-class TestFindDevUrdPathGitButNoWincorpUrd:
-    def test_git_found_but_wincorp_urd_absent_returns_none(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """_find_dev_urd_path : .git trouve mais wincorp-urd absent → None.
-
-        Patch Path(__file__) pour pointer vers un ancetre avec .git mais sans wincorp-urd.
-        """
-        # Creer une structure .git sans wincorp-urd frere
-        fake_repo = tmp_path / "fake_repo"
-        fake_repo.mkdir()
-        (fake_repo / ".git").mkdir()
-        # Pas de wincorp-urd frere : tmp_path / "wincorp-urd" n'existe pas
-
-        fake_src = fake_repo / "src" / "wincorp_odin" / "orchestration"
-        fake_src.mkdir(parents=True)
-        fake_file = fake_src / "valkyries_fake.py"
-        fake_file.write_text("# fake", encoding="utf-8")
-
-        from wincorp_odin.orchestration.valkyries import _find_dev_urd_path
-
-        # La vraie implementation cherche dans les parents de __file__.
-        # En mode dev, elle trouve wincorp-urd (retourne Path).
-        # Ce test verifie la non-regression : pas de crash.
-        result = _find_dev_urd_path()
-        assert result is None or isinstance(result, Path)  # ne doit pas crasher
 
 
 class TestResolveDevUrdPathFoundWithYaml:
@@ -1326,59 +1333,6 @@ class TestCheckMtimeSwapAtomicOSError:
 # ---------------------------------------------------------------------------
 # ValkyrieToolGuard._generate : else branch (non-AIMessage generation)
 # ---------------------------------------------------------------------------
-
-class TestAGenerateDirectCoverage:
-    """Couvre les lignes 785-786 : branche TRUE dans _agenerate (AIMessage filtrage).
-
-    LangChain 0.3+ route ainvoke() via _astream si _astream est defini,
-    donc _agenerate n'est jamais appele par ainvoke. Test direct obligatoire.
-    """
-
-    def test_agenerate_aimessage_branch_covered(self) -> None:
-        """Appel direct guard._agenerate avec AIMessage → lignes 785-786 couvertes."""
-        from wincorp_odin.orchestration.valkyries import ValkyrieToolGuard
-
-        cfg = _make_valkyrie_config(blocked_tools=["task"])
-
-        class _AIMessageModel(BaseChatModel):
-            model_config = ConfigDict(arbitrary_types_allowed=True)
-
-            @property
-            def _llm_type(self) -> str:
-                return "ai-model"
-
-            def _generate(self, messages: list[BaseMessage], **kwargs: Any) -> ChatResult:
-                return ChatResult(generations=[ChatGeneration(message=AIMessage(content="sync"))])
-
-            async def _agenerate(
-                self, messages: list[BaseMessage], **kwargs: Any
-            ) -> ChatResult:
-                # Retourne AIMessage avec un bloc tool_use bloque
-                msg = AIMessage(content=[
-                    {"type": "text", "text": "avant"},
-                    {"type": "tool_use", "id": "x1", "name": "task", "input": {}},
-                ])
-                return ChatResult(generations=[ChatGeneration(message=msg)])
-
-            def _stream(self, messages: list[BaseMessage], **kwargs: Any) -> Iterator[ChatGenerationChunk]:
-                yield ChatGenerationChunk(message=AIMessageChunk(content="stream"))
-
-            async def _astream(self, messages: list[BaseMessage], **kwargs: Any) -> AsyncIterator[ChatGenerationChunk]:
-                yield ChatGenerationChunk(message=AIMessageChunk(content="astream"))
-
-        inner = _AIMessageModel()
-        guard = ValkyrieToolGuard(wrapped=inner, config=cfg)
-
-        async def _run() -> ChatResult:
-            return await guard._agenerate([AIMessage(content="test")])
-
-        result = asyncio.run(_run())
-        assert len(result.generations) == 1
-        # Le bloc task doit etre filtre
-        content = result.generations[0].message.content
-        assert isinstance(content, list)
-        types = [b.get("type") for b in content if isinstance(b, dict)]
-        assert "tool_use" not in types
 
 
 class TestToolGuardGenerateElseBranch:

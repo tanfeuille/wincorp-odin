@@ -1,12 +1,12 @@
 # valkyries — Specification
 
-> **Statut :** DRAFT
-> **Version :** 1.2
+> **Statut :** IMPLEMENTED
+> **Version :** 1.4.1
 > **Niveau :** 2 (standard)
 > **Auteur :** Tan Phi HUYNH
 > **Date de creation :** 2026-04-24
 > **Reference plan amont :** [wincorp-odin/specs/valkyries.plan.md](valkyries.plan.md) (GO recu 2026-04-24 00:30)
-> **Changelog vs v1.0 :** 13 corrections audit #1 + 4 corrections audit #1bis (re-review v1.1). Pivot enforcement vers Option 3 (middleware LangChain reel) `feedback_robust_over_temporary`. Fix C1 `MappingProxyType` non-hashable → `tuple[tuple[str, Any], ...]`. Fix C2 `BaseChatModel` Pydantic → `ConfigDict` + `_llm_type`. Swap atomique sans fenetre clear+update. Barrier timeout 5s. Voir §14.
+> **Changelog vs v1.3 :** Buffer accumulation streaming complet (`_StreamToolBuffer`). Supprime l'hypothese Anthropic "type+name ensemble" de v1.3. Support multi-provider streaming (Anthropic + OpenAI-compat fragmentation). v1.4.1 post re-audit C : reconstruction `input` JSON depuis `input_json_delta` accumules (sinon consommateur aval recoit input tronque) + rename cle interne `_buf_partial_json` (anti-collision provider futur) + fallback chaine brute si JSON malforme + WARNING `valkyrie_tool_input_json_invalid`. Voir §14.
 
 ---
 
@@ -24,10 +24,11 @@ Scope v1.0 : 3 roles + loader + middleware + factory + tests comportementaux. L'
 
 - Charge `wincorp-urd/referentiels/valkyries.yaml` (path resolu via `_resolve_urd_path` miroir de `llm/config.py`).
 - Parse et valide le schema YAML (champs obligatoires, plages numeriques, whitelist tools, existence `model` dans models.yaml).
-- Expose `ValkyrieConfig` dataclass `frozen=True` hashable (via `MappingProxyType` pour `extra_kwargs` et `frozenset` pour `blocked_tools`).
+- Expose `ValkyrieConfig` dataclass `frozen=True` hashable (via `tuple[tuple[str, Any], ...]` items tries pour `extra_kwargs` et `frozenset` pour `blocked_tools`).
 - Expose `load_valkyrie(name)`, `list_valkyries()`, `validate_all_valkyries()`.
 - Cache thread-safe avec invalidation mtime throttled 1 Hz (copy-on-write PB-019, pattern `llm/factory.py`).
-- Expose **`ValkyrieToolGuard(BaseChatModel)`** : middleware langchain-core qui override `_generate/_agenerate/_stream/_astream`, filtre les `tool_use` blocks dont `name ∈ config.blocked_tools`, log WARNING, remplace par bloc texte synthetique informant l'agent.
+- Expose **`ValkyrieToolGuard(BaseChatModel)`** : middleware langchain-core qui override `_generate/_stream/_astream` (pas `_agenerate` — LangChain 0.3+ route `ainvoke()` via `_astream`, cf §5.5), filtre les `tool_use` blocks dont `name ∈ config.blocked_tools`, log WARNING, remplace par bloc texte synthetique informant l'agent. Utilise `_StreamToolBuffer` pour l'accumulation inter-chunks en mode streaming.
+- Expose **`_StreamToolBuffer`** (classe helper interne, non exportee) : accumulation des fragments `tool_use` par `index` jusqu'au bloc complet avant evaluation filtre. Support multi-provider (Anthropic, OpenAI-compat).
 - Expose **`create_valkyrie_chat(role: str) -> BaseChatModel`** : factory qui compose `load_valkyrie(role)` + `create_model(config.model)` + `ValkyrieToolGuard(wrapped, config)`.
 - Expose `ValkyrieConfig.to_dict() -> dict[str, Any]` pour serialisation JSON (consumers heimdall/bifrost).
 - API echappatoire tests : `_reload_for_tests()` (non exportee).
@@ -93,13 +94,22 @@ class ValkyrieToolGuard(BaseChatModel):
     """Wrapper BaseChatModel qui filtre les tool_use blocks interdits.
 
     Compose un chat model sous-jacent + ValkyrieConfig. Override _generate,
-    _agenerate, _stream, _astream. Parcourt AIMessage.content (list Anthropic
+    _stream, _astream. Parcourt AIMessage.content (list Anthropic
     content blocks), filtre blocs type='tool_use' dont name ∈ config.blocked_tools.
+
+    Note : _agenerate non implementé. LangChain 0.3+ route ainvoke() via _astream
+    quand disponible. Le middleware couvre sync (_generate) + async (_astream)
+    sans _agenerate redondant.
 
     Strategie : remplacement par bloc texte synthetique, pas raise. L'agent
     recoit feedback et peut adapter sa strategie (re-demander un autre tool).
 
-    Logs : WARNING structure a chaque filtre (role, tool_name, trace_id si present).
+    Logs : WARNING structure a chaque filtre (role, tool_name, trace_id depuis run_manager.run_id).
+
+    Streaming (v1.4) : _stream et _astream utilisent _StreamToolBuffer pour accumuler
+    les fragments tool_use inter-chunks avant evaluation. Aucune hypothese sur le
+    schema de chunking du provider (Anthropic, OpenAI-compat, DeepSeek). Le filtre
+    est applique sur le bloc complet reconstitue.
     """
 
     # OBLIGATOIRE (audit #1bis C2) : BaseChatModel herite de Pydantic BaseModel.
@@ -117,9 +127,11 @@ class ValkyrieToolGuard(BaseChatModel):
     def _llm_type(self) -> str:
         return "wincorp-valkyrie-guard"
 
-    def _filter_response(self, response: AIMessage) -> AIMessage: ...
+    @staticmethod
+    def _extract_trace_id(run_manager: Any) -> str: ...
+    def _filter_content_block(self, block: Any, trace_id: str = "unknown") -> Any: ...
+    def _filter_response(self, response: AIMessage, trace_id: str = "unknown") -> AIMessage: ...
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult: ...
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult: ...
     def _stream(self, messages, stop=None, run_manager=None, **kwargs) -> Iterator[ChatGenerationChunk]: ...
     async def _astream(self, messages, stop=None, run_manager=None, **kwargs) -> AsyncIterator[ChatGenerationChunk]: ...
 ```
@@ -137,7 +149,7 @@ Pas de `ValkyrieToolBlockedError` : le middleware filtre, ne raise pas (strategi
 
 ### 3.5 API echappatoire tests
 
-- `_reload_for_tests() -> None` — vide cache + mtime + **invalide aussi les instances ValkyrieToolGuard connues** (via registry weak ref, cf §5.6). Non exportee.
+- `_reload_for_tests() -> None` — vide cache + mtime. Les instances `ValkyrieToolGuard` existantes conservent leur `ValkyrieConfig` snapshot (cf §5.6 — recréation explicite plus déterministe). Non exportée.
 
 ## 4. Schema YAML
 
@@ -255,7 +267,7 @@ Erreurs discriminantes :
 
 **Objectif** : enforcement reel des `blocked_tools` au niveau LLM runtime (couche 2 `feedback_guardrails_theatre_vs_reel`).
 
-**Interception** : override `BaseChatModel._generate`, `_agenerate`, `_stream`, `_astream` :
+**Interception** : override `BaseChatModel._generate`, `_stream`, `_astream` (pas `_agenerate`, cf note ci-dessous) :
 1. Appel du wrapped chat model → obtient `AIMessage` (ou stream de `AIMessageChunk`).
 2. Parcourt `response.content` :
    - Si `content` est str : pass-through integral (pas de tool_use possible).
@@ -264,7 +276,11 @@ Erreurs discriminantes :
      - Sinon pass-through bloc intact.
 3. Retourne `AIMessage` modifiee.
 
-**Streaming** : chaque `AIMessageChunk` contenant un fragment `tool_use` accumule est evalue au bloc complet (fin de fragment). Si bloc complet bloque → chunk remplacee par text chunk synthetique + WARNING. Partial chunks non-bloquants pass-through immediat.
+**Streaming (v1.4)** : `_stream` et `_astream` utilisent `_StreamToolBuffer` pour accumulation inter-chunks. Chaque bloc `tool_use` est identifie par son `index`. Les fragments (`type` seul, puis `name`, puis `input_json_delta`) sont accumules jusqu'a ce qu'un bloc d'index different ou un bloc non-tool_use soit recu, ou en fin de stream via flush final. Le filtre est applique sur le bloc complet reconstuit. L'hypothese v1.3 "Anthropic envoie name dans le premier chunk" est supprimee — le buffer fonctionne pour tout provider (Anthropic, OpenAI-compat, DeepSeek).
+
+**`_agenerate` non implementé** : LangChain 0.3+ route `ainvoke()` via `_astream` quand `_astream` est defini. Le middleware couvre donc sync (`_generate`) + async (`_astream`) sans `_agenerate` redondant. Ajouter `_agenerate` serait du dead code non atteignable par l'API publique LangChain.
+
+**`trace_id`** : extrait de `run_manager.run_id` (UUID LangChain converti en str). Fallback `"unknown"` si `run_manager` absent ou `run_id` None.
 
 **Pas de raise** : filtre + log + feedback textuel a l'agent. L'agent peut re-proposer un autre tool dans le tour suivant, comportement naturel langchain.
 
@@ -301,7 +317,7 @@ Format structure (key=value) :
 4. Champs obligatoires presents (appliquer `defaults:` heritage si configure).
 5. Plages numeriques : `timeout ∈ [30, 1800]`, `turns ∈ [1, 500]`, `concurrent ∈ [1, 20]`, sinon `ValkyrieRangeError`.
 6. `blocked_tools` chaque element ∈ whitelist statique (§4.3), sinon erreur.
-7. `extra_kwargs` : dict (converti en `MappingProxyType` immuable ensuite).
+7. `extra_kwargs` : dict (converti en `tuple[tuple[str, Any], ...]` items tries immuable ensuite).
 8. `model` existe dans `models.yaml` ET non disabled, sinon `ValkyrieModelRefError` discriminant.
 9. `description` : str, len ∈ [1, 200).
 
@@ -391,7 +407,7 @@ Couverture attendue : **100% branch** (strict Odin). Zero appel reseau (mocks po
 ```
 wincorp-odin/tests/orchestration/
   test_valkyries_loader.py      # unit loader R1-R14 + EC1-EC9 + EC13
-  test_valkyries_toolguard.py   # middleware R15-R17 + EC10-EC12
+  test_valkyries_toolguard.py   # middleware R15-R17 + EC10-EC12 + TestR17StreamBufferAccumulation
   test_valkyries_factory.py     # create_valkyrie_chat R18
   test_valkyries_stress.py      # R9 concurrence 100 threads + EC7 barrier
 ```
@@ -476,6 +492,8 @@ Lecture `list_valkyries()` + `load_valkyrie()` + `ValkyrieConfig.to_dict()` pour
 | 1.0 DRAFT | 2026-04-24 | Specification initiale. Plan amont valide 2026-04-24 00:30. |
 | 1.1 DRAFT | 2026-04-24 | 13 corrections post audit #1 adversarial : (1) enforcement reel middleware ValkyrieToolGuard Option 3 — directive `feedback_robust_over_temporary.md` ; (2) `extra_kwargs: MappingProxyType` ; (3) formalisation §12.1 wrapper produit ; (4) R13 config_version migration + R14 extra_kwargs passthrough ; (5) EC7 threading.Barrier testable ; (6) §5.1 fenetre clear+update documentee + EC13 dedicated ; (7) §5.4 ordre locks strict ; (8) §6.2 messages discriminants inconnu/disabled + chemin absolu ; (9) `to_dict()` serialisation JSON ; (10) §5.7 logs obligatoires ; (11) EC6 tout-ou-rien explicite ; (12) R15-R18 tests middleware comportementaux ; (13) exports etendus. |
 | 1.2 DRAFT | 2026-04-24 | 4 corrections re-review v1.1 (audit #1bis) : (C1) `MappingProxyType` **non-hashable** (CPython #87995) → remplace par `tuple[tuple[str, Any], ...]` items tries, propage R1/R12/D11/§3.1 + validation values hashable au load ; (C2) `BaseChatModel` = Pydantic → ajout `model_config = ConfigDict(arbitrary_types_allowed=True)` + `_llm_type` property obligatoire (sans quoi PydanticUserError + ABC non-instantiable) ; (I1 amelioration) abandon pattern `clear()+update()` → **swap atomique** `_configs_ref = new_dict` via GIL, supprime la fenetre par design, EC13 obsolete ; (M5) `threading.Barrier(2, timeout=5)` + `BrokenBarrierError` skip handling pour eviter flakiness CI EC7. |
+| 1.3 IMPLEMENTED | 2026-04-24 | 6 corrections post audit #2 (`feedback_robust_over_temporary`) : (C1) Suppression `_agenerate` dead code — LangChain 0.3+ route `ainvoke()` via `_astream`, `_agenerate` jamais atteint par API publique ; suppression test `TestAGenerateDirectCoverage` gaming coverage ; §3.3 + §5.5 documentes. (C2) `trace_id` dynamique : `_filter_content_block`/`_filter_response` acceptent `trace_id: str`, extrait de `run_manager.run_id` via `_extract_trace_id()` statique, 3 tests comportementaux `TestTraceIdFromRunManager`. (C3) Suppression/refactor 7 tests gaming : `test_find_dev_urd_path_no_git`/`test_git_found_but_wincorp_urd_absent_returns_none` (assertions tautologiques `is None or isinstance`), `test_agenerate_non_aimessage_passthrough` (dead code), refactor assertions `is not None` → vérifications contenu exact sur 5 tests, `TestFilterContentBlockNonDict` refactore vers API publique. (I1) `match=` ajoutes sur 8 `pytest.raises` (EC2/EC3/EC4/EC5 loader, 2 coverage). (I2) §3.5 corrige (registry weak ref rejete, recréation explicite documentée). Statut passe IMPLEMENTED. |
+| 1.4 IMPLEMENTED | 2026-04-24 | Buffer accumulation streaming complet (classe `_StreamToolBuffer`). Supprime l'hypothese Anthropic "type+name ensemble" de v1.3. Support multi-provider streaming (Anthropic + OpenAI-compat fragmentation). `_stream`/`_astream` refactores : buffer par `index`, flush sur nouveau index ou fin de stream, preservation ordre FIFO. Flush final emit les blocs incomplets comme malformes (WARNING). Base saine Phase 4 multi-providers (`feedback_robust_over_temporary`). ~120 lignes code + 11 tests comportementaux streaming (`TestR17StreamBufferAccumulation`). 100% branch coverage maintenu (392 stmts, 150 branches). Ruff clean, mypy strict clean. |
 
 ## 15. Glossaire
 

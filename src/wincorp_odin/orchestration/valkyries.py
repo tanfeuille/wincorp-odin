@@ -1,6 +1,6 @@
 """Registre declaratif des roles produit d'agents (valkyries).
 
-@spec specs/valkyries.spec.md v1.2
+@spec specs/valkyries.spec.md v1.4
 
 Charge wincorp-urd/referentiels/valkyries.yaml (source unique).
 Expose ValkyrieConfig (dataclass frozen hashable), loader + middleware
@@ -11,6 +11,7 @@ lock court. Aucune fenetre visible contrairement au pattern clear+update.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -652,6 +653,196 @@ def validate_all_valkyries() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _StreamToolBuffer — accumulation inter-chunks (spec §5.5 v1.4)
+# ---------------------------------------------------------------------------
+
+
+class _StreamToolBuffer:
+    """Accumule les fragments tool_use par index jusqu'au bloc complet.
+
+    Strategie :
+    - Chaque bloc tool_use est identifie par son ``index`` (cle de deduplication).
+    - Accumule ``name`` (peut arriver fragmente sur plusieurs chunks) +
+      ``input`` (partial_json_delta cumule comme chaine).
+    - Flush un bloc = emet le bloc accumule apres evaluation filtre/pass-through.
+    - Triggers de flush : nouveau bloc d'index different, fin de stream explicite
+      via ``flush()``.
+    - Les blocs non-tool_use (text, etc.) sont retournes immediatement, apres
+      flush des blocs tool_use pending d'index precedents (ordre FIFO preserve).
+    - Blocs incomplets en fin de stream (name absent) : emis comme blocs malformes
+      (meme comportement que ``_filter_content_block`` sur name=None) + WARNING.
+
+    Multi-provider : le buffer fonctionne pour tout provider emettant des blocs
+    fragmentes (Anthropic, OpenAI-compat via tool_calls). Pas d'hypothese sur le
+    schema interne — seul ``index`` est utilise pour l'accumulation tool_use. Pour
+    les formats OpenAI-compat (``tool_calls`` list), le caller doit normaliser en
+    blocs dict avec ``type``/``name``/``index`` avant d'appeler ``accumulate``.
+    """
+
+    def __init__(
+        self, blocked_tools: frozenset[str], role: str, trace_id: str
+    ) -> None:
+        # index → dict accumule en cours de construction
+        self._pending: dict[int, dict[str, Any]] = {}
+        # Ordre d'arrivee des index (FIFO pour flush ordonne)
+        self._pending_order: list[int] = []
+        self._blocked_tools = blocked_tools
+        self._role = role
+        self._trace_id = trace_id
+
+    # ------------------------------------------------------------------
+    # API publique
+    # ------------------------------------------------------------------
+
+    def accumulate(self, block: Any) -> list[Any]:
+        """Accumule un bloc entrant.
+
+        Retourne la liste des blocs a emettre immediatement (blocs completes
+        ou blocs non-tool_use). Les blocs tool_use en cours d'accumulation ne
+        sont pas emis tant qu'ils ne sont pas completes.
+
+        Args:
+            block: Bloc dict (peut etre un fragment tool_use, un delta input,
+                   un bloc text, etc.) ou valeur non-dict (pass-through brut).
+
+        Returns:
+            Liste (possiblement vide) de blocs a emettre dans le chunk courant.
+        """
+        if not isinstance(block, dict):
+            # Non-dict : flush pending PUIS retourne le bloc brut
+            return self._flush_all() + [block]
+
+        block_type = block.get("type")
+
+        # --- Fragments input JSON (delta input d'un tool_use en cours) ---
+        if block_type == "input_json_delta":
+            idx = block.get("index")
+            if idx is not None and idx in self._pending:
+                existing = self._pending[idx]
+                partial = block.get("partial_json", "")
+                existing["_buf_partial_json"] = existing.get("_buf_partial_json", "") + str(partial)
+            # delta seul : rien a emettre
+            return []
+
+        # --- Bloc tool_use (complet ou partiel) ---
+        if block_type == "tool_use":
+            idx = block.get("index")
+            if idx is None:
+                # Pas d'index : traiter comme bloc complet sans accumulation
+                return self._flush_all() + [self._evaluate_block(block)]
+
+            if idx not in self._pending:
+                # Nouvel index : demarrer accumulation
+                self._pending[idx] = dict(block)
+                self._pending_order.append(idx)
+                return []
+            else:
+                # Meme index : fusionner les champs arrivant fragmentes
+                existing = self._pending[idx]
+                # Completer les champs manquants avec ceux du nouveau fragment.
+                # Note : _buf_partial_json est une cle interne, jamais presente dans
+                # les blocs entrants (providers). La condition couvre uniquement
+                # les champs natifs du bloc (id, name, input, type...).
+                for key, val in block.items():
+                    if key not in existing or existing[key] is None:
+                        existing[key] = val
+                return []
+
+        # --- Tout autre bloc (text, etc.) ---
+        # Flush tous les tool_use pending AVANT d'emettre le bloc courant
+        return self._flush_all() + [block]
+
+    def flush(self) -> list[Any]:
+        """Flush tous les blocs tool_use pending (appele en fin de stream).
+
+        Les blocs dont le name est present sont evalues (filtre ou pass-through).
+        Les blocs incomplets (name absent) sont traites comme malformes + WARNING.
+
+        Returns:
+            Liste de blocs emis (evalues).
+        """
+        return self._flush_all()
+
+    # ------------------------------------------------------------------
+    # Helpers prives
+    # ------------------------------------------------------------------
+
+    def _flush_all(self) -> list[Any]:
+        """Flush et retourne tous les blocs pending dans l'ordre d'arrivee."""
+        if not self._pending_order:
+            return []
+        result: list[Any] = []
+        for idx in self._pending_order:
+            block = self._pending[idx]
+            result.append(self._evaluate_block(block))
+        self._pending.clear()
+        self._pending_order.clear()
+        return result
+
+    def _evaluate_block(self, block: dict[str, Any]) -> dict[str, Any]:
+        """Evalue un bloc tool_use complet : filtre si bloque, sinon pass-through.
+
+        Applique la meme semantique que ``ValkyrieToolGuard._filter_content_block``
+        mais sur un bloc potentiellement reconstruit par accumulation.
+
+        Args:
+            block: Bloc tool_use accumule (peut avoir _buf_partial_json interne).
+
+        Returns:
+            Bloc original nettoy, bloc text synthetique si bloque, ou bloc
+            malforme si name absent.
+        """
+        tool_name = block.get("name")
+
+        # Bloc malforme (name absent meme apres accumulation complete)
+        if tool_name is None:
+            logger.warning(
+                "valkyrie_tool_blocked role=%s tool=<malforme> trace_id=%s "
+                "[tool_use malforme filtre]",
+                self._role,
+                self._trace_id,
+            )
+            return {"type": "text", "text": "[tool_use malforme filtre]"}
+
+        # Reconstituer `input` depuis les input_json_delta accumules.
+        # Sans cela, le consommateur aval (agent LLM, Phase 3.5) recoit un `input`
+        # tronque sur les tools autorises (pass-through).
+        clean_block = {k: v for k, v in block.items() if k != "_buf_partial_json"}
+        partial = block.get("_buf_partial_json", "")
+        if partial:
+            try:
+                clean_block["input"] = json.loads(partial)
+            except json.JSONDecodeError:
+                # Fallback : conserver la chaine brute (caller decidera).
+                # Log WARNING pour signaler JSON malforme du provider.
+                logger.warning(
+                    "valkyrie_tool_input_json_invalid role=%s tool=%s trace_id=%s",
+                    self._role,
+                    tool_name,
+                    self._trace_id,
+                )
+                clean_block["input"] = partial
+
+        # Bloc bloque
+        if tool_name in self._blocked_tools:
+            logger.warning(
+                "valkyrie_tool_blocked role=%s tool=%s trace_id=%s",
+                self._role,
+                tool_name,
+                self._trace_id,
+            )
+            return {
+                "type": "text",
+                "text": (
+                    f"[tool_use '{tool_name}' rejete : valkyrie '{self._role}' "
+                    f"n'a pas ce tool. Utiliser un autre moyen.]"
+                ),
+            }
+
+        return clean_block
+
+
+# ---------------------------------------------------------------------------
 # ValkyrieToolGuard — middleware LangChain (enforcement reel)
 # ---------------------------------------------------------------------------
 
@@ -660,14 +851,18 @@ class ValkyrieToolGuard(BaseChatModel):
     """Wrapper BaseChatModel qui filtre les tool_use blocks interdits.
 
     Compose un chat model sous-jacent + ValkyrieConfig. Override _generate,
-    _agenerate, _stream, _astream. Parcourt AIMessage.content (list Anthropic
+    _stream, _astream. Parcourt AIMessage.content (list Anthropic
     content blocks), filtre blocs type='tool_use' dont name appartient a
     config.blocked_tools.
+
+    Note : _agenerate non implementé. LangChain 0.3+ route ainvoke() via
+    _astream quand disponible. Le middleware couvre sync (_generate) +
+    async (_astream) sans _agenerate redondant.
 
     Strategie : remplacement par bloc texte synthetique, jamais de raise.
     L'agent recoit feedback et peut adapter sa strategie.
 
-    Logs : WARNING structure a chaque filtre (role, tool_name).
+    Logs : WARNING structure a chaque filtre (role, tool_name, trace_id).
 
     OBLIGATOIRE (audit #1bis C2) : ConfigDict(arbitrary_types_allowed=True)
     car BaseChatModel herite de Pydantic BaseModel — Pydantic refuserait sinon
@@ -684,11 +879,12 @@ class ValkyrieToolGuard(BaseChatModel):
         """Type LLM obligatoire LangChain (BaseChatModel est abstract sur ce point)."""
         return "wincorp-valkyrie-guard"
 
-    def _filter_content_block(self, block: Any) -> Any:
+    def _filter_content_block(self, block: Any, trace_id: str = "unknown") -> Any:
         """Filtre un bloc content Anthropic.
 
         Args:
             block: Bloc dict (type, ...) ou autre.
+            trace_id: Identifiant de trace pour les logs (run_manager.run_id).
 
         Returns:
             Bloc original si autorise, bloc texte synthetique si bloque/malforme.
@@ -705,18 +901,20 @@ class ValkyrieToolGuard(BaseChatModel):
         # Bloc malforme (name absent)
         if tool_name is None:
             logger.warning(
-                "valkyrie_tool_blocked role=%s tool=<malforme> trace_id=unknown "
+                "valkyrie_tool_blocked role=%s tool=<malforme> trace_id=%s "
                 "[tool_use malforme filtre]",
                 self.config.name,
+                trace_id,
             )
             return {"type": "text", "text": "[tool_use malforme filtre]"}
 
         # Bloc bloque
         if tool_name in self.config.blocked_tools:
             logger.warning(
-                "valkyrie_tool_blocked role=%s tool=%s trace_id=unknown",
+                "valkyrie_tool_blocked role=%s tool=%s trace_id=%s",
                 self.config.name,
                 tool_name,
+                trace_id,
             )
             return {
                 "type": "text",
@@ -728,11 +926,12 @@ class ValkyrieToolGuard(BaseChatModel):
 
         return block
 
-    def _filter_response(self, response: AIMessage) -> AIMessage:
+    def _filter_response(self, response: AIMessage, trace_id: str = "unknown") -> AIMessage:
         """Filtre les tool_use blocks interdits dans le contenu de la reponse.
 
         Args:
             response: AIMessage retourne par le modele sous-jacent.
+            trace_id: Identifiant de trace pour les logs (run_manager.run_id).
 
         Returns:
             AIMessage avec blocks bloques remplaces par texte synthetique.
@@ -744,10 +943,27 @@ class ValkyrieToolGuard(BaseChatModel):
             return response
 
         # Content est une liste de blocs
-        filtered = [self._filter_content_block(block) for block in content]
+        filtered = [self._filter_content_block(block, trace_id=trace_id) for block in content]
 
         # Reconstruire AIMessage avec contenu filtre
         return AIMessage(content=filtered)
+
+    @staticmethod
+    def _extract_trace_id(run_manager: Any) -> str:
+        """Extrait le trace_id depuis run_manager.run_id (LangChain CallbackManager).
+
+        Args:
+            run_manager: CallbackManagerForLLMRun ou None.
+
+        Returns:
+            str(run_id) si present, sinon "unknown".
+        """
+        if run_manager is None:
+            return "unknown"
+        run_id = getattr(run_manager, "run_id", None)
+        if run_id is None:
+            return "unknown"
+        return str(run_id)
 
     def _generate(
         self,
@@ -757,31 +973,12 @@ class ValkyrieToolGuard(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         """Override : genere via wrapped model + filtre blocked tools."""
+        trace_id = self._extract_trace_id(run_manager)
         result = self.wrapped._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         filtered_generations = []
         for gen in result.generations:
             if isinstance(gen.message, AIMessage):
-                filtered_msg = self._filter_response(gen.message)
-                filtered_generations.append(ChatGeneration(message=filtered_msg))
-            else:
-                filtered_generations.append(gen)
-        return ChatResult(generations=filtered_generations)
-
-    async def _agenerate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: Any = None,
-        **kwargs: Any,
-    ) -> ChatResult:
-        """Override async : genere via wrapped model + filtre blocked tools."""
-        result = await self.wrapped._agenerate(
-            messages, stop=stop, run_manager=run_manager, **kwargs
-        )
-        filtered_generations = []
-        for gen in result.generations:
-            if isinstance(gen.message, AIMessage):
-                filtered_msg = self._filter_response(gen.message)
+                filtered_msg = self._filter_response(gen.message, trace_id=trace_id)
                 filtered_generations.append(ChatGeneration(message=filtered_msg))
             else:
                 filtered_generations.append(gen)
@@ -794,11 +991,22 @@ class ValkyrieToolGuard(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        """Override stream : filtre tool_use blocks bloques dans les chunks.
+        """Override stream : accumulation inter-chunks + filtre tool_use bloques.
 
-        Chaque chunk contenant un bloc tool_use complet est evalue. Si bloque,
-        le chunk est remplace par un text chunk synthetique.
+        Utilise ``_StreamToolBuffer`` pour accumuler les blocs tool_use fragmentes
+        (nom ou input arrives sur plusieurs chunks) avant evaluation filtre. Garantit
+        que la decision de filtrage est prise sur le bloc complet, quelque soit le
+        provider (Anthropic, OpenAI-compat, DeepSeek).
+
+        L'ordre des blocs sortants respecte l'ordre d'accumulation FIFO.
         """
+        trace_id = self._extract_trace_id(run_manager)
+        buffer = _StreamToolBuffer(
+            blocked_tools=self.config.blocked_tools,
+            role=self.config.name,
+            trace_id=trace_id,
+        )
+
         for chunk in self.wrapped._stream(
             messages, stop=stop, run_manager=run_manager, **kwargs
         ):
@@ -811,10 +1019,21 @@ class ValkyrieToolGuard(BaseChatModel):
                 yield chunk
                 continue
 
-            # Liste de blocs : filtrer
-            filtered = [self._filter_content_block(block) for block in content]
-            filtered_msg = AIMessageChunk(content=filtered)
-            yield ChatGenerationChunk(message=filtered_msg)
+            # Liste de blocs : passer au buffer
+            emitted_blocks: list[Any] = []
+            for block in content:
+                emitted_blocks.extend(buffer.accumulate(block))
+
+            if emitted_blocks:
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(content=emitted_blocks),
+                    generation_info=chunk.generation_info,
+                )
+
+        # Fin du stream : flush les blocs tool_use en cours d'accumulation
+        final_blocks = buffer.flush()
+        if final_blocks:
+            yield ChatGenerationChunk(message=AIMessageChunk(content=final_blocks))
 
     async def _astream(
         self,
@@ -823,7 +1042,19 @@ class ValkyrieToolGuard(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        """Override async stream : filtre tool_use blocks bloques dans les chunks."""
+        """Override async stream : accumulation inter-chunks + filtre tool_use bloques.
+
+        Meme logique que ``_stream`` (buffer ``_StreamToolBuffer``), version async.
+        LangChain 0.3+ route ainvoke() via _astream quand disponible — ce chemin
+        couvre donc sync (_generate) + async (this method) sans _agenerate redondant.
+        """
+        trace_id = self._extract_trace_id(run_manager)
+        buffer = _StreamToolBuffer(
+            blocked_tools=self.config.blocked_tools,
+            role=self.config.name,
+            trace_id=trace_id,
+        )
+
         async for chunk in self.wrapped._astream(
             messages, stop=stop, run_manager=run_manager, **kwargs
         ):
@@ -836,10 +1067,21 @@ class ValkyrieToolGuard(BaseChatModel):
                 yield chunk
                 continue
 
-            # Liste de blocs : filtrer
-            filtered = [self._filter_content_block(block) for block in content]
-            filtered_msg = AIMessageChunk(content=filtered)
-            yield ChatGenerationChunk(message=filtered_msg)
+            # Liste de blocs : passer au buffer
+            emitted_blocks: list[Any] = []
+            for block in content:
+                emitted_blocks.extend(buffer.accumulate(block))
+
+            if emitted_blocks:
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(content=emitted_blocks),
+                    generation_info=chunk.generation_info,
+                )
+
+        # Fin du stream : flush les blocs tool_use en cours d'accumulation
+        final_blocks = buffer.flush()
+        if final_blocks:
+            yield ChatGenerationChunk(message=AIMessageChunk(content=final_blocks))
 
 
 # ---------------------------------------------------------------------------
