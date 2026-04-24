@@ -1,11 +1,12 @@
 # orchestration — Specification
 
 > **Statut :** IMPLEMENTED
-> **Version :** 2.1.1
+> **Version :** 2.1.2
 > **Niveau :** 2 (standard)
 > **Auteur :** Tan Phi HUYNH
 > **Date de creation :** 2026-04-23
-> **Livraison :** 2026-04-23 branche `feat/orchestration` — 203 tests verts, 100% branch coverage, ruff + mypy strict clean.
+> **Derniere livraison :** 2026-04-24 — CR-025 (shutdown polling deadline-based) + CR-009 (spec bump doc re-check `_uuid_factory`). Tests 207+ verts.
+> **Changelog vs v2.1.1 :** CR-025 `shutdown` utilise polling actif avec deadline au lieu de `Event().wait(force_timeout_sec)` passif → exit rapide quand 0 task RUNNING restante. Preservation EC70/EC71. Bump patch 2.1.2.
 > **Changelog vs v2.0 :** 23 corrections post re-review adversariale #2 (5 bloquants, 11 majeurs, 7 mineurs). Voir §9.
 
 ---
@@ -658,7 +659,8 @@ def _json_safe(obj: Any, *, _path: str = "$") -> Any:
   - 1er appel sous `_state_lock` : `_closed = True`, force CANCELLED sur tous PENDING (sous `entry._lock` respectifs), set cancel_event sur tous RUNNING.
   - Hors lock : `_scheduler_pool.shutdown(wait=wait, cancel_futures=cancel_futures)`.
   - `_exec_pool.shutdown(wait=False, cancel_futures=True)` — **wait=False force** car `pool.shutdown(wait=True)` bloquerait indefiniment sur task zombie (Python 3.12 n'a pas `timeout=` avant 3.14, aucun moyen stdlib de limiter l'attente avec kill).
-  - Si `force_timeout_sec` non None : `threading.Event().wait(force_timeout_sec)` laisse le temps aux tasks coop de sortir, puis scan `threading.enumerate()` pour threads non-daemon `subagent-exec-*` encore vivants → log WARNING avec `task_id`, `thread.ident`, stack.
+  - Si `force_timeout_sec` non None : **polling actif avec deadline** `time.monotonic() + force_timeout_sec` — boucle `running_events = [e._done_event for e in _entries if e.status == RUNNING]` + `wait(timeout=min(remaining, 0.05))` jusqu'a `running_events` vide OU deadline atteinte (v2.1.2, CR-025). Puis scan `threading.enumerate()` pour threads non-daemon `subagent-exec-*` encore vivants → log WARNING avec `task_id`, `thread.ident`, stack.
+  - v2.1.1 et avant : `threading.Event().wait(force_timeout_sec)` systematique = shutdown lent meme si toutes tasks coop sortent rapidement. Corrige en v2.1.2.
   - Threads zombies restent vivants (threads non-daemon, process ne peut pas exit avant fin coop). Pas de kill (Python ne le permet pas proprement).
   - 2e appel `shutdown()` : sortie immediate (`_closed == True` deja).
 - **R13** — `SubagentExecutor` context manager :

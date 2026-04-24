@@ -311,6 +311,67 @@ def test_ec71_force_timeout_none_no_scan(
     assert elapsed < 1.0
 
 
+# --- CR-025 (v2.1.2) : shutdown polling deadline-based -------------------
+
+
+def test_cr025_shutdown_early_exit_no_running_tasks(
+    frozen_now: Callable[[], datetime],
+    uuid_factory_seq: Callable[[], str],
+) -> None:
+    """CR-025 : shutdown(force_timeout_sec=10.0) sans tasks RUNNING -> exit rapide.
+
+    Avant v2.1.2 : wait(10.0) systematique = ~10s meme sans task.
+    Apres v2.1.2 : polling voit 0 RUNNING -> exit immediat.
+    """
+    import time
+
+    ex = SubagentExecutor(
+        _now_factory=frozen_now,
+        _uuid_factory=uuid_factory_seq,
+    )
+    start = time.monotonic()
+    ex.shutdown(force_timeout_sec=10.0)  # Valeur elevee deliberement
+    elapsed = time.monotonic() - start
+    # CR-025 : exit immediat car 0 RUNNING. Avant CR-025 : ~10s.
+    assert elapsed < 0.5, (
+        f"CR-025 regression : shutdown a pris {elapsed:.2f}s au lieu de <0.5s "
+        f"(polling deadline-based casse, retombe sur wait passif)."
+    )
+
+
+def test_cr025_shutdown_early_exit_after_task_coop_done(
+    frozen_now: Callable[[], datetime],
+    uuid_factory_seq: Callable[[], str],
+) -> None:
+    """CR-025 : shutdown attend juste assez pour que task coop sorte, pas deadline complet.
+
+    Task qui sort en ~100ms -> shutdown avec force_timeout_sec=5.0 doit durer ~100-200ms,
+    pas 5s complets.
+    """
+    import time
+
+    ex = SubagentExecutor(
+        _now_factory=frozen_now,
+        _uuid_factory=uuid_factory_seq,
+    )
+
+    def short_task(state: Any, cancel_event: threading.Event) -> None:
+        # Task rapide qui sort normalement en ~50ms.
+        cancel_event.wait(timeout=0.05)
+
+    tid = ex.submit(short_task, initial_state={}, timeout_sec=2.0, trace_id="t")
+    ex.wait(tid, timeout=2.0)  # S'assure que task a fini
+
+    start = time.monotonic()
+    ex.shutdown(force_timeout_sec=5.0)
+    elapsed = time.monotonic() - start
+    # Task a deja fini avant shutdown -> 0 RUNNING -> exit immediat.
+    assert elapsed < 0.5, (
+        f"CR-025 regression : shutdown a pris {elapsed:.2f}s au lieu de <0.5s "
+        f"(task deja terminee, deadline ne devrait pas etre consomme)."
+    )
+
+
 # --- FAILED on generic exception ------------------------------------------
 
 

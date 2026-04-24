@@ -1,6 +1,6 @@
 """SubagentExecutor : orchestration concurrente bornee (Phase 2 DeerFlow).
 
-@spec specs/orchestration.spec.md v2.1.1 §3.4 + R8-R13, R16, R18b, R19-R24
+@spec specs/orchestration.spec.md v2.1.2 §3.4 + R8-R13, R16, R18b, R19-R24
 
 API non-bloquante :
     - submit()   retourne task_id immediatement (uuid4 si None).
@@ -22,6 +22,7 @@ import logging
 import math
 import sys
 import threading
+import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping
@@ -470,7 +471,26 @@ class SubagentExecutor:
                     _FORCE_TIMEOUT_DEFAULT,
                 )
                 force_timeout_sec = _FORCE_TIMEOUT_DEFAULT
-            threading.Event().wait(force_timeout_sec)
+            # CR-025 (v2.1.2) : polling actif avec deadline au lieu de Event().wait()
+            # passif. Exit des que 0 task RUNNING restante OU deadline atteinte.
+            # Avant v2.1.2 : wait(force_timeout_sec) systematique = shutdown lent
+            # meme si toutes les tasks coop sortent rapidement.
+            deadline = time.monotonic() + force_timeout_sec
+            with self._state_lock:
+                running_events = [
+                    entry._done_event
+                    for entry in self._entries.values()
+                    if entry.status == SubagentStatus.RUNNING
+                ]
+            while running_events:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                running_events = [e for e in running_events if not e.is_set()]
+                if not running_events:
+                    break
+                # Poll 50ms (threading.Event jetable, attente passive)
+                threading.Event().wait(timeout=min(remaining, 0.05))
             zombies = [
                 t
                 for t in threading.enumerate()
