@@ -14,7 +14,7 @@ import pytest
 
 # Chemin suppose du vrai URD en dev
 _URD_CANDIDATES = [
-    Path("C:/Users/Tanfeuille/Documents/wincorp-dev/wincorp-urd/referentiels/models.yaml"),
+    Path("C:/Users/Tanfeuille/Documents/wincorp-workspace/wincorp-urd/referentiels/models.yaml"),
     Path(__file__).resolve().parents[4] / "wincorp-urd" / "referentiels" / "models.yaml",
 ]
 

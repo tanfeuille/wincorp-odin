@@ -12,7 +12,7 @@
 **Commande exécutée (verbatim)** :
 
 ```bash
-MEM="C:/Users/Tanfeuille/.claude/projects/C--Users-Tanfeuille-Documents-wincorp-dev/memory"
+MEM="C:/Users/Tanfeuille/.claude/projects/C--Users-Tanfeuille-Documents-wincorp-workspace/memory"
 ls "$MEM"/feedback_*.md | xargs -I {} basename {} .md | \
   grep -Ei "valkyrie|yaml|registry|config|cache|parallelism|orchestration|tool|blocked|architect|decoupl|read_complete|theatre|contract_change|plan_amont|no_pruning|fix_at_source|verify_memory|model_selection" | sort
 ```
@@ -122,7 +122,7 @@ feedback_verify_memory_before_proposing
 
 ## 7. Audits multi-agent prévus
 
-Conformément à [`feedback_contract_change_audit.md:1`](.claude/projects/C--Users-Tanfeuille-Documents-wincorp-dev/memory/feedback_contract_change_audit.md:1) :
+Conformément à [`feedback_contract_change_audit.md:1`](.claude/projects/C--Users-Tanfeuille-Documents-wincorp-workspace/memory/feedback_contract_change_audit.md:1) :
 
 - **Audit #1 AVANT code (spec DRAFT v1.0)** : 3 agents parallèles
   - `feature-dev:code-architect` (opus) — approches alternatives schema YAML + couplage loader/executor

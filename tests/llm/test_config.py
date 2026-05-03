@@ -482,8 +482,8 @@ def test_r17_dev_mode_autodetects_wincorp_dev(
 
     monkeypatch.delenv("WINCORP_URD_PATH", raising=False)
 
-    # Creer une simili-arbo : tmp/wincorp-dev/wincorp-odin/.git + tmp/wincorp-urd/referentiels/models.yaml
-    dev_root = tmp_path / "wincorp-dev"
+    # Creer une simili-arbo : tmp/wincorp-workspace/wincorp-odin/.git + tmp/wincorp-urd/referentiels/models.yaml
+    dev_root = tmp_path / "wincorp-workspace"
     odin = dev_root / "wincorp-odin"
     odin_src = odin / "src" / "wincorp_odin" / "llm"
     odin_src.mkdir(parents=True)

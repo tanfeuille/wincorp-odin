@@ -327,7 +327,7 @@ wincorp-odin/src/wincorp_odin/llm/
 - **R15 — Taille max YAML 1 MB** : `Path.stat().st_size` vérifié **avant** `read_text()`. Si > 1 Mo → `ModelConfigError` FR « models.yaml > 1 Mo, suspicion fichier corrompu ou bourré de duplications ». Borne arbitraire mais très supérieure aux usages légitimes (~2 Ko pour 5-10 modèles). Voir §19 « Mitigation parsing » pour la justification de l'abandon d'un timeout parsing dédié.
 - **R17 — Résolution path URD bifurquée dev vs installed** :
   - **Mode explicite** (`WINCORP_URD_PATH` env var définie) : `Path(env).resolve()` → passe par `_assert_under_allowed_root(resolved)` qui vérifie l'appartenance à `Path.home()` OU à `project_root` (remontée 10 parents depuis `__file__` cherchant `.git` ou `pyproject.toml`). Sinon → `ModelConfigError` FR **générique** sans exposer le chemin tenté. Retourne ensuite `resolved / "referentiels" / "models.yaml"`.
-  - **Mode implicite** (env var absente) : parcourt `Path(__file__).resolve().parents[:5]` à la recherche d'un ancêtre contenant `.git`. Si trouvé : dev local, ancêtre = `wincorp-odin/`, on remonte à `wincorp-dev/` et on tente `wincorp-urd/referentiels/models.yaml`. Si `.exists()` → OK. Sinon → break (ne pas dépasser l'ancêtre `.git`).
+  - **Mode implicite** (env var absente) : parcourt `Path(__file__).resolve().parents[:5]` à la recherche d'un ancêtre contenant `.git`. Si trouvé : dev local, ancêtre = `wincorp-odin/`, on remonte à `wincorp-workspace/` et on tente `wincorp-urd/referentiels/models.yaml`. Si `.exists()` → OK. Sinon → break (ne pas dépasser l'ancêtre `.git`).
   - **Installed sans env var** (pas de `.git` trouvé, pas d'env var) : `ModelConfigError` **FATAL startup** FR actionnable — `"WINCORP_URD_PATH obligatoire en déploiement installed. Définir la variable dans le .env du service (valeur = chemin absolu vers le dossier wincorp-urd/). Détection dev/prod : présence de .git dans les 5 parents."`
   - **Plus de fallback silencieux vers `$HOME`** : v1.1 autorisait implicitement toute racine `$HOME` en l'absence de `.git`, ouvrant une surface d'attaque. v1.2 force l'explicite en mode installed.
   - Helper `_assert_under_allowed_root(path: Path) -> None` : raise `ModelConfigError("Path hors racine autorisée")` **générique** (pas de révélation du path tenté). Chemin journalisé en DEBUG pour investigation Tan.
@@ -809,7 +809,7 @@ Déjà présentes dans `wincorp-odin/[project.optional-dependencies].dev` : `pyt
 
 > Objectif : Tan non-dev doit comprendre l'erreur sans regarder la stack.
 
-1. **EC1** — `[ERREUR] Fichier de configuration LLM introuvable. Chemin tenté : <chemin SI sous racine autorisée, sinon [masqué]>. Vérifier la variable d'environnement WINCORP_URD_PATH ou la présence de wincorp-urd/ à côté de wincorp-dev/.`
+1. **EC1** — `[ERREUR] Fichier de configuration LLM introuvable. Chemin tenté : <chemin SI sous racine autorisée, sinon [masqué]>. Vérifier la variable d'environnement WINCORP_URD_PATH ou la présence de wincorp-urd/ à côté de wincorp-workspace/.`
 2. **EC4** — `[ERREUR] Modèle 'sonnet' (ligne 12 de models.yaml) incomplet. Champs obligatoires manquants : [use, model, api_key]. Ajouter ces champs ou retirer ce bloc.`
 3. **EC5** — `[ERREUR] Modèle 'haiku' : champ 'supports_thinking' attendu bool (true/false), reçu str ("yes"). Corriger la valeur.`
 4. **EC6** — `[ERREUR] Nom 'sonnet' déclaré 2 fois dans models.yaml (lignes 12 et 34). Les noms doivent être uniques.`

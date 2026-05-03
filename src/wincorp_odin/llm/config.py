@@ -269,7 +269,7 @@ def _resolve_urd_path() -> Path:
             raise ModelConfigError(
                 f"[ERREUR] Fichier de configuration LLM introuvable. "
                 f"Chemin tente : {yaml_path}. Verifier la variable d'environnement "
-                f"WINCORP_URD_PATH ou la presence de wincorp-urd/ a cote de wincorp-dev/."
+                f"WINCORP_URD_PATH ou la presence de wincorp-urd/ a cote de wincorp-workspace/."
             )
         return yaml_path
 

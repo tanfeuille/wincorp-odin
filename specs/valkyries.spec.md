@@ -326,7 +326,7 @@ Format structure (key=value) :
 Gabarit `ValkyrieRangeError` :
 ```
 [ERREUR] Valkyrie 'sigrun' : timeout_seconds=2000 hors plage [30, 1800].
-         Fichier : C:\Users\Tanfeuille\Documents\wincorp-dev\wincorp-urd\referentiels\valkyries.yaml
+         Fichier : C:\Users\Tanfeuille\Documents\wincorp-workspace\wincorp-urd\referentiels\valkyries.yaml
 ```
 
 Gabarit `ValkyrieModelRefError` inconnu :
